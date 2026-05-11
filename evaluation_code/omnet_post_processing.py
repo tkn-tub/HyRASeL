@@ -8,13 +8,13 @@ import re
 from itertools import product
 from pathlib import Path
 import math
-from datetime import datetime, time
+from datetime import datetime
 
 
 from scipy.optimize import least_squares
 
 
-# OVERALL CONSTANTS 
+# GLOBAL CONSTANTS
 POLL = 0
 RESP = 1
 FINAL = 2
@@ -33,25 +33,101 @@ CLOCK = "clock_timestamp"
 SIM = "sim_timestamp"
 NOISY = "noisy_timestamp"
 
+
+def build_transmission_lookup(df: pd.DataFrame) -> dict[tuple[int, int, int, int], dict | None]:
+    """ Build an O(1) lookup table for transmissions keyed by receiver, sender, sequence number, and repetition.
+
+    Args:
+        df (pd.DataFrame): Input dataframe containing transmission and reception events.
+
+    Returns:
+        dict[tuple[int, int, int, int], dict | None]: Mapping from (NodeId, srcId, seqNo, Rep) to row data. Duplicate keys are mapped to None.
+    """
+    lookup: dict[tuple[int, int, int, int], dict | None] = {}
+    duplicate_keys: set[tuple[int, int, int, int]] = set()
+
+    for row in df.to_dict("records"):
+        key = (int(row["NodeId"]), int(row["srcId"]), int(row["seqNo"]), int(row["Rep"]))
+        if key in lookup:
+            duplicate_keys.add(key)
+            lookup[key] = None
+        elif key not in duplicate_keys:
+            lookup[key] = row
+
+    return lookup
+
+
+
+
+def _get_position_from_record(row: dict | pd.Series) -> np.ndarray:
+    """ Extract a 3D position vector from a row-like object.
+
+    Args:
+        row (dict | pd.Series): Row containing X, Y, and Z coordinate fields.
+
+    Returns:
+        np.ndarray: Position vector with x, y, and z coordinates.
+    """
+    return np.array([row["X"], row["Y"], row["Z"]], dtype=float)
+
+def build_node_reception_lookup(node_rx_df: pd.DataFrame) -> dict[tuple[int, int], pd.Series | None]:
+    """ Build a lookup table for received messages of one node keyed by sender and sequence number.
+
+    Args:
+        node_rx_df (pd.DataFrame): Reception dataframe for one node and one repetition.
+
+    Returns:
+        dict[tuple[int, int], pd.Series | None]: Mapping from (srcId, seqNo) to the matching reception row. Duplicate keys are mapped to None.
+    """
+    lookup: dict[tuple[int, int], pd.Series | None] = {}
+    duplicate_keys: set[tuple[int, int]] = set()
+
+    for _, row in node_rx_df.iterrows():
+        key = (int(row["srcId"]), int(row["seqNo"]))
+        if key in lookup:
+            duplicate_keys.add(key)
+            lookup[key] = None
+        elif key not in duplicate_keys:
+            lookup[key] = row
+
+    return lookup
+
 def solve_tdoa_least_squares(
     tdoa_sets: list[tuple[np.ndarray, np.ndarray]],
     speed_of_signal: float = 299792458.0,
     initial_guess: np.ndarray | None = None,
-    sigma_r: float = 1.0  
+    sigma_r: float = 1.0,  # optional standard deviation of the range measurement in meters
+    compute_dop: bool = True,
+    max_nfev: int | None = None
 ) -> tuple[np.ndarray, dict]:
-    """
+    """ Estimate a position from one or more TDoA anchor sets using nonlinear least squares.
+
     Args:
-        tdoa_sets: List of Tupels:
-                   [(anchor_positions, time_diffs), ...]
-                   anchor_positions: Shape (N,2) or (N,3)
-                   time_diffs: Shape (N-1,)
+        tdoa_sets (list[tuple[np.ndarray, np.ndarray]]): List of tuples containing anchor positions and time differences.
+        speed_of_signal (float): Propagation speed used to convert time differences into range differences.
+        initial_guess (np.ndarray | None): Optional initial position estimate for the optimizer.
+        sigma_r (float): Standard deviation of the range measurement in meters for DOP estimation.
+        compute_dop (bool): Whether to compute PDOP, HDOP, VDOP, covariance, and condition number.
+        max_nfev (int | None): Optional maximum number of function evaluations for the optimizer.
+
+    Returns:
+        tuple[np.ndarray, dict]: Estimated position and diagnostic information from the optimizer.
     """
+
+    # If no initial estimate is provided, use the centroid of all anchors.
     if initial_guess is None:
         all_anchors = np.vstack([anchors for anchors, _ in tdoa_sets])
         initial_guess = np.mean(all_anchors, axis=0)
 
     def residuals(pos):
+        """ Compute stacked TDoA residuals for the current optimizer position.
 
+        Args:
+            pos (np.ndarray): Current position estimate evaluated by the optimizer.
+
+        Returns:
+            np.ndarray: Concatenated residual vector over all TDoA anchor sets.
+        """
         all_residuals = []
 
         for anchor_positions, time_differences in tdoa_sets:
@@ -73,9 +149,18 @@ def solve_tdoa_least_squares(
 
         return np.concatenate(all_residuals)
 
-    result = least_squares(residuals, 
-                           initial_guess, 
-                           method="lm")
+    result = least_squares(
+        residuals,
+        initial_guess,
+        method="lm",
+        max_nfev=max_nfev,
+    )
+    # result = least_squares(residuals, 
+    #                     initial_guess, 
+    #                     method="trf",
+    #                     loss="huber",
+    #                     f_scale=5.0
+    #                     )
 
     info = {
         "success": result.success,
@@ -84,33 +169,44 @@ def solve_tdoa_least_squares(
         "residuals": result.fun
     }
 
-    # GDoP-Calculation (Generated with AI)    
-    # Jacobian at estimated position
-    J = result.jac  # shape: (num_residuals, dim_position)
-    JTJ = J.T @ J
-    Q = np.linalg.pinv(JTJ) * sigma_r**2
+    if compute_dop:
+        # Compute DOP values from the optimizer Jacobian at the estimated position.
+        J = result.jac  # shape: (num_residuals, dim_position)
+        JTJ = J.T @ J
+        Q = np.linalg.pinv(JTJ) * sigma_r**2
 
-    # PDOP / HDOP / VDOP
-    dim = Q.shape[0]
-    PDOP = np.sqrt(np.trace(Q))
-    if dim == 3:
-        HDOP = np.sqrt(Q[0,0] + Q[1,1])
-        VDOP = np.sqrt(Q[2,2])
-    else:  # 2D-Case
-        HDOP = np.sqrt(Q[0,0] + Q[1,1])
-        VDOP = None
+        dim = Q.shape[0]
+        PDOP = float(np.sqrt(np.trace(Q)))
+        if dim == 3:
+            HDOP = float(np.sqrt(Q[0, 0] + Q[1, 1]))
+            VDOP = float(np.sqrt(Q[2, 2]))
+        else:
+            HDOP = float(np.sqrt(Q[0, 0] + Q[1, 1]))
+            VDOP = None
 
-    cond = np.linalg.cond(JTJ)
-    info.update({"PDOP": PDOP, "HDOP": HDOP, "VDOP": VDOP, "Q_pos": Q, "cond": cond})
+        cond = float(np.linalg.cond(JTJ))
+        info.update({"PDOP": PDOP, "HDOP": HDOP, "VDOP": VDOP, "Q_pos": Q, "cond": cond})
+    else:
+        info.update({"PDOP": None, "HDOP": None, "VDOP": None, "Q_pos": None, "cond": None})
 
     return result.x, info
 
 
 def compute_self_loc_statistics(df: pd.DataFrame, timestamp_format: str = SIM, use_v_twr_pos: bool = False) -> pd.DataFrame:
-    # Initialize/add new fields that are to be filled during runtime
+    """ Compute virtual TWR and self-localization statistics for all mobile nodes.
+
+    Args:
+        df (pd.DataFrame): Input dataframe containing all simulation events.
+        timestamp_format (str): Timestamp column used for all timing calculations.
+        use_v_twr_pos (bool): Whether virtual TWR positions should be used for non-anchor nodes.
+
+    Returns:
+        pd.DataFrame: Input dataframe enriched with virtual TWR and self-localization result columns.
+    """
+    # Initialize columns that are filled during post-processing.
 
     df["_idx"] = df.index
-    df_lookup = df.set_index(["NodeId", "srcId", "seqNo", "Rep"]).sort_index()
+    tx_lookup = build_transmission_lookup(df)
 
     df["self_loc_pos_estimate"] = None
     df["self_loc_error"] = None
@@ -121,51 +217,81 @@ def compute_self_loc_statistics(df: pd.DataFrame, timestamp_format: str = SIM, u
     df["PDOP"] = None
     df["cond"] = None
 
-    # Extract info from the df
+    # Extract dataframe metadata used for iteration.
     repetitions     = df["Rep"].unique()
     unique_seq_nos  = df["seqNo"].unique()
     mobile_node_ids    = df.loc[df["Node_Name"].str.contains("node", case=False, na=False), "NodeId"].unique()
 
-    # # Get virtual TWR Statistics
-    _estimate_node_positions_virtual_twr(df, df_lookup, mobile_node_ids, repetitions, timestamp_format)
+    # Repetitions are handled together with node IDs below.
 
-    # Reload df_lookup with new columns
-    df_lookup = df.set_index(["NodeId", "srcId", "seqNo", "Rep"]).sort_index()
 
+    # Compute virtual TWR statistics before self-localization.
+    _estimate_node_positions_virtual_twr(df, tx_lookup, mobile_node_ids, repetitions, timestamp_format)
+
+    # Rebuild lookup after virtual TWR columns have been updated.
+    tx_lookup = build_transmission_lookup(df)
+
+
+    # Compute self-localization statistics.
+    # _estimate_node_position_self_loc()
     # Get Self Loc Statistics
     for node_id, rep in product(mobile_node_ids, repetitions):
-        # Get all data, that the specific node receives
-        node_rx_df = _get_node_reception_data(df, node_id, rep)
+        # Get all messages received by the selected node.
+        node_rx_df = _get_node_reception_data(df, node_id, rep).copy()
         node_rx_df["tdoa_info"] = None
-        for seq_no in unique_seq_nos:
-            seq_rx_df = node_rx_df.loc[node_rx_df["seqNo"] == seq_no]
+        rx_sender_seq_lookup = build_node_reception_lookup(node_rx_df)
+        node_rx_by_seq = {seq: group for seq, group in node_rx_df.groupby("seqNo", sort=False)}
 
-            # SELF LOC Localization
-            for msg_record_idx in seq_rx_df.index: 
-                _compute_localization_per_incoming_message(df, df_lookup, node_id, seq_rx_df, node_rx_df, rep, seq_no, msg_record_idx, timestamp_format=timestamp_format, use_v_twr_pos=use_v_twr_pos)
+        # Preserve the original script semantics: iterate over the globally observed sequence numbers
+        # in their original order, not over the per-node group order. This matters because anchor
+        # stitching stores intermediate state in node_rx_df and is therefore order-dependent.
+        for seq_no in unique_seq_nos:
+            seq_rx_df = node_rx_by_seq.get(seq_no)
+            if seq_rx_df is None:
+                continue
+
+            # Self-localization.
+            # Each row represents one message; process each incoming message in dataframe index order.
+            for msg_record_idx in seq_rx_df.index:
+                _compute_localization_per_incoming_message(df, tx_lookup, node_id, seq_rx_df, node_rx_df, rx_sender_seq_lookup, rep, seq_no, msg_record_idx, timestamp_format=timestamp_format, use_v_twr_pos=use_v_twr_pos)
+
+            # Anchor stitching is handled inside the per-message localization function.
 
 
     return df
 
-def _estimate_node_positions_virtual_twr(df: pd.DataFrame, df_lookup: pd.DataFrame, mobile_node_ids: list, repetitions: list, timestamp_format: str = SIM):
-    # Get virtual TWR Statistics
+def _estimate_node_positions_virtual_twr(df: pd.DataFrame, df_lookup: dict | pd.DataFrame, mobile_node_ids: list, repetitions: list, timestamp_format: str = SIM):
+    """ Estimate virtual TWR positions for mobile nodes from overheard anchor responses.
+
+    Args:
+        df (pd.DataFrame): Dataframe that is updated in place with virtual TWR results.
+        df_lookup (dict): Lookup table for transmission and reception rows.
+        mobile_node_ids (list): IDs of mobile nodes to process.
+        repetitions (list): Experiment repetitions to process.
+        timestamp_format (str): Timestamp column used for timing calculations.
+
+    Returns:
+        None: Results are written directly into df.
+    """
+    # Compute virtual TWR statistics.
     for node_id, rep in product(mobile_node_ids, repetitions):
-        # Get all entries where the node transmits
+        # Get all entries where the node transmits.
         node_tx_df = df.query("srcId == @node_id and NodeId == @node_id and Rep == @rep")
         node_rx_df = _get_node_reception_data(df, node_id, rep) # pd.Series
         for msg_record in node_tx_df.iloc[::-1].itertuples(): # Itertuples for speed
+            # The loop uses tuples for speed while lookup rows are dictionaries.
             v_final_seq_no = msg_record.seqNo
             v_poll_seq_no  = v_final_seq_no - 1
-            # Was there a previous message?
+            # Check whether a previous message exists.
             v_poll_tx = _get_transmission_for_receiver(df_lookup, node_id, node_id, v_poll_seq_no, rep)
             if v_poll_tx is None: 
-                continue # There was no previous message then
+                continue # No previous message exists.
             
-            v_poll_tx_idx = int(v_poll_tx["_idx"]) # Pandas Series -> .name
-            v_final_tx_idx = msg_record.Index # Pandas Core -> Name of Index Entry
+            v_poll_tx_idx = int(v_poll_tx["_idx"]) # Lookup dictionary row index.
+            v_final_tx_idx = msg_record.Index # Original dataframe index.
             between_df = node_rx_df.loc[v_poll_tx_idx:v_final_tx_idx]
 
-            # ONLY ANCHORS FOR LOCALIZATION!
+            # Only anchors are used for localization.
             anchor_ids = between_df.query("src_is_anchor == True")["srcId"].unique()
 
             confirmed_anchor_ids = []
@@ -192,8 +318,14 @@ def _estimate_node_positions_virtual_twr(df: pd.DataFrame, df_lookup: pd.DataFra
                 anchor_seq_no = anchor_seq_no.iloc[0]
 
                 v_resp_rx_ts = between_df.query("srcId == @anchor_id")[timestamp_format].squeeze()
+            
+                # v_resp_tx_ts = df.query("srcId == @anchor_id and NodeId == @anchor_id and seqNo == @anchor_seq_no and Rep == @rep")[timestamp_format].squeeze()
                 v_resp_tx_ts = _get_transmission_for_receiver(df_lookup, anchor_id, anchor_id, anchor_seq_no, rep)[timestamp_format]
+
+                # v_poll_rx_ts = df.query("srcId == @node_id   and NodeId == @anchor_id and seqNo == @v_poll_seq_no and Rep == @rep")[timestamp_format].squeeze()
                 v_poll_rx_ts = _get_transmission_for_receiver(df_lookup, node_id, anchor_id, v_poll_seq_no, rep)[timestamp_format]
+
+                # v_final_rx_ts= df.query("srcId == @node_id   and NodeId == @anchor_id and seqNo == @v_final_seq_no and Rep == @rep")[timestamp_format].squeeze()
                 v_final_rx_ts = _get_transmission_for_receiver(df_lookup, node_id, anchor_id, v_final_seq_no, rep)[timestamp_format]
 
                 tof = calc_twr_tof(
@@ -207,10 +339,14 @@ def _estimate_node_positions_virtual_twr(df: pd.DataFrame, df_lookup: pd.DataFra
                 try: 
                     float(tof)
                 except: 
-                    raise Exception("Some shit went wrong")
-                anchor_pos = np.array(_get_transmission_for_receiver(df_lookup, node_id, anchor_id, v_final_seq_no, rep)[["X", "Y", "Z"]])
+                    raise Exception("Time-of-flight calculation returned a non-numeric value")
+
+                # anchor_pos = np.array(df.query("srcId == @node_id   and NodeId == @anchor_id and seqNo == @v_final_seq_no and Rep == @rep")[["X", "Y", "Z"]].squeeze())
+                anchor_pos = _get_position_from_record(_get_transmission_for_receiver(df_lookup, node_id, anchor_id, v_final_seq_no, rep))
                 anchor_positions.append(anchor_pos)
-            node_position = np.array(_get_transmission_for_receiver(df_lookup, node_id, node_id, v_final_seq_no, rep)[["X", "Y", "Z"]])
+
+            # node_position = np.array(node_tx_df.query("seqNo == @v_final_seq_no and srcId == @node_id and NodeId == @node_id and Rep == @rep")[["X", "Y", "Z"]].squeeze())
+            node_position = _get_position_from_record(_get_transmission_for_receiver(df_lookup, node_id, node_id, v_final_seq_no, rep))
             estimated_pos = estimate_twr_position(anchor_positions, tofs)
 
             pos_error = math.dist(node_position, estimated_pos)
@@ -220,30 +356,48 @@ def _estimate_node_positions_virtual_twr(df: pd.DataFrame, df_lookup: pd.DataFra
 
 
 
-def _compute_localization_per_incoming_message(df: pd.DataFrame, df_lookup: pd.DataFrame, node_id: int, seq_rx_df: pd.DataFrame, node_rx_df: pd.DataFrame, rep: int, seq_no: int, msg_record_idx: int, timestamp_format: str = SIM, use_v_twr_pos: bool = False):
+def _compute_localization_per_incoming_message(df: pd.DataFrame, df_lookup: dict, node_id: int, seq_rx_df: pd.DataFrame, node_rx_df: pd.DataFrame, rx_sender_seq_lookup: dict, rep: int, seq_no: int, msg_record_idx: int, timestamp_format: str = SIM, use_v_twr_pos: bool = False):
+    """ Compute a self-localization estimate for one received message.
+
+    Args:
+        df (pd.DataFrame): Global dataframe that is updated with localization results.
+        df_lookup (dict): Lookup table for transmission and reception rows.
+        node_id (int): ID of the receiving node being localized.
+        seq_rx_df (pd.DataFrame): All receptions with the current sequence number for the node.
+        node_rx_df (pd.DataFrame): All receptions of the node in the current repetition.
+        rx_sender_seq_lookup (dict): Lookup table for node receptions keyed by sender and sequence number.
+        rep (int): Experiment repetition.
+        seq_no (int): Current sequence number.
+        msg_record_idx (int): Index of the current received message.
+        timestamp_format (str): Timestamp column used for timing calculations.
+        use_v_twr_pos (bool): Whether virtual TWR positions should be used for non-anchor nodes.
+
+    Returns:
+        bool | None: True if a direct localization was computed, otherwise None.
+    """
     
-    # Get the information to the message that the current node receives (one row only)
+    # Get the message received by the current node.
     node_current_rx = seq_rx_df.loc[msg_record_idx]
     
-    # Get the sender that was transmitting this message
+    # Get the sender of the current message.
     sender_id = node_current_rx["srcId"]
 
-    # Get the previous information from the previous transmission of the sender
-    node_prev_rx = _get_node_reception_from_sender(node_rx_df, sender_id, seq_no-1) # pd.Series
+    # Get the previous message received from the same sender.
+    node_prev_rx = rx_sender_seq_lookup.get((int(sender_id), int(seq_no - 1)))
 
-    # If there was no previous transmission, we can continue with the next row, as we are not going to get a localization
+    # Without a previous sender transmission, no localization can be computed.
     if node_prev_rx is None:
         return
 
-    # Get index of the current and the last transmission of the sender
+    # Get the indices of the current and previous sender transmissions.
     prev_index = node_prev_rx.name
     current_index = node_current_rx.name 
     between_df = node_rx_df.loc[prev_index:current_index]
 
-    # Get the IDs of all the anchors, that the sender and the receiver node have heard
+    # Get all anchor IDs that were heard by both sender and receiver.
     anchor_ids, anchor_seq_nos = _get_valid_anchors_with_seqnos(between_df, df_lookup, sender_id, seq_no, rep)
 
-    # Get the true position at the time at which the node receives the message
+    # Get the true node position at the message reception time.
     true_pos = (node_current_rx["X"], node_current_rx["Y"], node_current_rx["Z"])
     current_index = node_current_rx.name
 
@@ -254,14 +408,14 @@ def _compute_localization_per_incoming_message(df: pd.DataFrame, df_lookup: pd.D
     if (sender_current_pos is None) & (sender_current_tx["node_is_anchor"]==False):
         return
 
-    # Get all the time differences and anchor positions
+    # Compute all time differences and anchor positions for this round.
     anchor_positions, time_diffs = _compute_delta_ts_for_round(df, df_lookup, anchor_ids, anchor_seq_nos, sender_id, node_id, seq_no, rep, timestamp_format=timestamp_format, use_v_twr_pos=use_v_twr_pos)    
     
-    # We need to overhear at least 3 additional anchors (sender is an anchor itself, thus we have 4 in total) to continue
+    # At least three additional anchors are required because the sender is the reference anchor.
     valid_anchor_pairs = [(int(sender_id), int(anchor_id)) for anchor_id in anchor_ids]
 
-    # START ANCHOR STITCHING LOGIC
-    # I need the position of the reference anchor, position of the individual anchor, Ich brauche die Position des Referenz Ankers, die Position des Ankers, 
+    # Start anchor stitching logic.
+    # Store reference-anchor and other-anchor positions for possible anchor stitching.
     tdoa_info = {}
     for anchor_id, time_diff, anchor_pos in zip(anchor_ids, time_diffs, anchor_positions[1:]):
         sender_position = anchor_positions[0]
@@ -270,7 +424,7 @@ def _compute_localization_per_incoming_message(df: pd.DataFrame, df_lookup: pd.D
     node_rx_df.at[current_index, "tdoa_info"] = tdoa_info
     
 
-    # PERFORM ANCHOR STITCHING
+    # Perform anchor stitching.
     if (len(valid_anchor_pairs) < MIN_VALID_ANCHOR_PAIRS):
         # If this is not the case, try to get the position with anchor pairs of previous rounds
         stitched_anchor_pairs = [] 
@@ -282,7 +436,7 @@ def _compute_localization_per_incoming_message(df: pd.DataFrame, df_lookup: pd.D
         seen_pairs = {}
         for tdoa_info_dict in stitched_anchor_pairs:
             for anchor_pair, tdoa_info in tdoa_info_dict.items():
-                # sortiere das Paar, um (1,3) == (3,1) zu behandeln
+                # Sort the pair so that (1, 3) and (3, 1) are treated as the same pair.
                 sorted_anchor_pair = tuple(sorted(anchor_pair))
 
                 if sorted_anchor_pair not in seen_pairs:
@@ -294,16 +448,18 @@ def _compute_localization_per_incoming_message(df: pd.DataFrame, df_lookup: pd.D
                     current_index = tdoa_info[0]
                     if current_index > existing_index:
                         seen_pairs[sorted_anchor_pair] = (anchor_pair, tdoa_info)
+
+        # Convert the result back into list-of-dicts format.
         result = [{original_pair: info_list} for original_pair, info_list in seen_pairs.values()]
         
 
         if len(result) >= MIN_TIME_DIFFS_FOR_SELF_LOCALIZATION:            
-            # Get list of anchor_positions and time_diffs
+            # Build lists of anchor positions and time differences.
             ref_anchor_groups = {}
 
             for pair_dict in result:
                 for anchor_pair, pair_info in pair_dict.items():
-                    # First entry in tuple is the reference anchor
+                    # The first tuple entry is the reference anchor.
                     ref_anchor = anchor_pair[0]  
                     index, time_diff, ref_pos, other_pos = pair_info
 
@@ -312,16 +468,18 @@ def _compute_localization_per_incoming_message(df: pd.DataFrame, df_lookup: pd.D
 
                     ref_anchor_groups[ref_anchor].append((index, time_diff, ref_pos, other_pos))
 
-            # Sort per reference anchor by index so that the newest position comes first
+            # Sort each reference-anchor group by index so that the newest position is first.
             final_stitched_list = []
 
             for ref_anchor, entries in ref_anchor_groups.items():
-                # Sort descending by indey
+                # Sort by descending index.
                 entries_sorted = sorted(entries, key=lambda x: x[0], reverse=True)
 
-                # Reference-Position = Position of newest entry
+                # Use the newest entry as the reference-anchor position.
                 ref_pos_latest = entries_sorted[0][2]
-                positions_list = [ref_pos_latest]  
+
+                # Create position and time-difference lists.
+                positions_list = [ref_pos_latest]  # Reference anchor first.
                 time_diffs_list = []
 
                 for entry in entries_sorted:
@@ -332,7 +490,7 @@ def _compute_localization_per_incoming_message(df: pd.DataFrame, df_lookup: pd.D
                 final_stitched_list.append((np.asarray(positions_list), np.asarray(time_diffs_list)))
 
             estimated_pos, info = solve_tdoa_least_squares(final_stitched_list)
-            # Indicate that this position was achieved with anchor stitching
+            # Mark that this position was obtained with anchor stitching.
             df.at[current_index, "using_anchor_stitching"] = True
             error = math.dist(true_pos, estimated_pos)    
             df.at[current_index, "self_loc_pos_estimate"] = estimated_pos
@@ -342,11 +500,11 @@ def _compute_localization_per_incoming_message(df: pd.DataFrame, df_lookup: pd.D
             df.at[current_index, "cond"] = info["cond"]
         return
 
-    # If we have less than 3 time differences (which is the required minimum for 3D Hyperbolic Localization, we do not continue
+    # If fewer than three time differences are available, 3D hyperbolic localization is not possible.
     if (len(time_diffs) < MIN_TIME_DIFFS_FOR_SELF_LOCALIZATION):
         return
     
-    # Use the time diffs and anchor positions to estimate the position
+    # Estimate the position from time differences and anchor positions.
     estimated_pos, info = solve_tdoa_least_squares([(anchor_positions, time_diffs)])
 
     error = math.dist(true_pos, estimated_pos)    
@@ -355,43 +513,55 @@ def _compute_localization_per_incoming_message(df: pd.DataFrame, df_lookup: pd.D
     df.at[current_index, "residuals"] = info["residuals"]
     df.at[current_index, "PDOP"] = info["PDOP"]
     df.at[current_index, "cond"] = info["cond"]
-    return True # DEBUG
+    return True
 
 
 
 def _get_valid_anchors_with_seqnos(between_df: pd.DataFrame, df_lookup: pd.DataFrame, sender_id: int, seq_no: int, rep: int) -> list:
-    # Get all anchors that are not the sender himself and put them into a list
+    """ Identify anchors that provide valid current and previous messages for TDoA estimation.
+
+    Args:
+        between_df (pd.DataFrame): Reception rows between the previous and current sender message.
+        df_lookup (dict): Lookup table for transmission and reception rows.
+        sender_id (int): ID of the reference sender.
+        seq_no (int): Current sequence number.
+        rep (int): Experiment repetition.
+
+    Returns:
+        tuple[list, list]: Valid anchor IDs and their corresponding sequence numbers.
+    """
+    # Collect all anchors except the sender itself.
     anchor_ids = []
     anchor_seq_nos = []
 
     # Check for all anchors whose message was received within last ranging round
     for anchor_id in between_df["srcId"].unique():
-        # The sender itself is also in the list, so lets not use it
+        # The sender itself may be in the list, but it must not be used as an additional anchor.
         if anchor_id == sender_id: 
             continue
 
-        # Check whether the sender has received a message from all the anchors that were received within the last ranging round
-            # at the node, as this is prerequisite for TDoA estimation
+        # Check whether the sender received the anchor messages required for TDoA estimation.
+            # This is a prerequisite for TDoA estimation.
         anchor_current_rx_sender    = _get_transmission_for_receiver(df_lookup, sender_id, anchor_id, seq_no, rep)
         anchor_prev_rx_sender       = _get_transmission_for_receiver(df_lookup, sender_id, anchor_id, seq_no-1, rep)
         
-        # If either the current or the last message was not received, this anchor is not valid
+        # If either the current or previous message was not received, this anchor is invalid.
         if anchor_current_rx_sender is None or anchor_prev_rx_sender is None: 
             continue
         
-        # Get the most recent sequence number (iloc[-1]) of the anchor
+        # Get the most recent sequence number of the anchor.
         anchor_seq_no_df = between_df.loc[between_df["srcId"]==anchor_id]
         anchor_seq_no = anchor_seq_no_df.iloc[-1]["seqNo"]
 
-        # If the received tx is from a v-anchor, we need to check, whether it was able to get its position 
-            # using v-TWR; if not, we will not futher consider the node
+        # If the received transmission is from a virtual anchor, check whether it has a position estimate.
+            # If not, the node cannot be used as an anchor.
         if (anchor_current_rx_sender["node_is_anchor"] == False): #
             anchor_current_tx = _get_transmission_for_receiver(df_lookup, anchor_id, anchor_id, anchor_seq_no, rep)
             anchor_position_vtwr = anchor_current_tx["v_twr_pos"]
             if anchor_position_vtwr is None: 
                 continue
 
-        # If everything went well, we add the node to the list
+        # Add the anchor after all validity checks passed.
         anchor_ids.append(anchor_id)
         anchor_seq_nos.append(anchor_seq_no)
 
@@ -399,6 +569,23 @@ def _get_valid_anchors_with_seqnos(between_df: pd.DataFrame, df_lookup: pd.DataF
 
 
 def _compute_delta_ts_for_round(df: pd.DataFrame, df_lookup: pd.DataFrame, anchor_ids: list, anchor_seq_nos: list, sender_id:int, node_id: int, seq_no: int, rep: int, timestamp_format: str = SIM, use_v_twr_pos: bool = False)->tuple[np.array, np.array]:
+    """ Compute TDoA time differences and anchor positions for one localization round.
+
+    Args:
+        df (pd.DataFrame): Input dataframe, kept for compatibility with existing call sites.
+        df_lookup (dict): Lookup table for transmission and reception rows.
+        anchor_ids (list): Anchor IDs used in the current round.
+        anchor_seq_nos (list): Anchor sequence numbers corresponding to anchor_ids.
+        sender_id (int): ID of the reference sender.
+        node_id (int): ID of the receiving node being localized.
+        seq_no (int): Current sequence number of the reference sender.
+        rep (int): Experiment repetition.
+        timestamp_format (str): Timestamp column used for timing calculations.
+        use_v_twr_pos (bool): Whether virtual TWR positions should be used for non-anchor nodes.
+
+    Returns:
+        tuple[np.ndarray, np.ndarray]: Anchor positions and computed time differences.
+    """
     node_current_rx_sender      = _get_transmission_for_receiver(df_lookup, sender_id, node_id, seq_no, rep)
     node_prev_rx_sender         = _get_transmission_for_receiver(df_lookup, sender_id, node_id, seq_no-1, rep)
     sender_current_tx           = _get_transmission_for_receiver(df_lookup, sender_id, sender_id, seq_no, rep)
@@ -451,18 +638,48 @@ def calc_self_loc_delta_t(s_rx1_a: float,
                            b_rx1_a: float, 
                            b_tx1: float, 
                            b_rx2_a: float, 
-                           t_ab: float)->float:
+                           t_ab: float) -> float:
+    """ Compute the self-localization time difference from sender, anchor, and receiver timestamps.
+
+    Args:
+        s_rx1_a (float): Receiver timestamp for the previous sender message.
+        s_rx1_b (float): Receiver timestamp for the anchor message.
+        s_rx2_a (float): Receiver timestamp for the current sender message.
+        b_rx1_a (float): Anchor timestamp for the previous sender message.
+        b_tx1 (float): Anchor transmit timestamp.
+        b_rx2_a (float): Anchor timestamp for the current sender message.
+        t_ab (float): Propagation time between sender and anchor.
+
+    Returns:
+        float: Estimated time difference for hyperbolic localization.
+    """
     R_ba = b_rx2_a - b_tx1
     D_ba = b_tx1 - b_rx1_a
     S_ab = s_rx1_b - s_rx1_a
     S_ba = s_rx2_a - s_rx1_b
-    numerator   = (R_ba*S_ab)-(S_ba*D_ba)-(t_ab*R_ba)-(t_ab*S_ab)+(t_ab**2)
-    denominator = R_ba+D_ba-t_ab
-    delta_t =  (numerator / denominator)
+    numerator = (R_ba * S_ab) - (S_ba * D_ba) - (t_ab * R_ba) - (t_ab * S_ab) + (t_ab**2)
+    denominator = R_ba + D_ba - t_ab
+    delta_t = numerator / denominator
     return delta_t
 
-def _get_transmission_for_receiver(df_lookup:pd.DataFrame, sender_id: int, receiver_id: int, seq_no: int, rep: int)-> pd.Series | None:
-    key = (receiver_id, sender_id, seq_no, rep)
+def _get_transmission_for_receiver(df_lookup: dict | pd.DataFrame, sender_id: int, receiver_id: int, seq_no: int, rep: int) -> dict | pd.Series | None:
+    """ Retrieve one transmission/reception row for a sender-receiver-sequence-repetition tuple.
+
+    Args:
+        df_lookup (dict | pd.DataFrame): Precomputed dictionary lookup or indexed dataframe.
+        sender_id (int): ID of the transmitting node.
+        receiver_id (int): ID of the receiving node.
+        seq_no (int): Sequence number of the message.
+        rep (int): Experiment repetition.
+
+    Returns:
+        dict | pd.Series | None: Matching row or None if no unique row exists.
+    """
+    key = (int(receiver_id), int(sender_id), int(seq_no), int(rep))
+
+    if isinstance(df_lookup, dict):
+        return df_lookup.get(key)
+
     try:
         row = df_lookup.loc[key]
         if isinstance(row, pd.DataFrame):
@@ -474,7 +691,16 @@ def _get_transmission_for_receiver(df_lookup:pd.DataFrame, sender_id: int, recei
 
 
 def _get_node_reception_from_sender(node_rx_df: pd.DataFrame, sender_id: int, seq_no: int) -> pd.Series | None:
-    """Holt Empfangsdaten eines bestimmten Senders für eine Sequenz."""
+    """ Retrieve one reception row for a specific sender and sequence number.
+
+    Args:
+        node_rx_df (pd.DataFrame): Reception dataframe for one receiving node.
+        sender_id (int): ID of the sender to search for.
+        seq_no (int): Sequence number to search for.
+
+    Returns:
+        pd.Series | None: Matching reception row or None if no row exists.
+    """
     mask = (
         (node_rx_df["srcId"] == sender_id) &
         (node_rx_df["seqNo"] == seq_no)
@@ -503,7 +729,7 @@ def _get_node_reception_data(df: pd.DataFrame, node_id: int, rep: int)->pd.DataF
     return df[mask]
 
 
-def compute_twr_response_statistics(df: pd.DataFrame, timestamp_format: str = SIM) -> pd.DataFrame: # Maybe rename to getSuccessfulTwrRangings()
+def compute_twr_response_statistics(df: pd.DataFrame, timestamp_format: str = SIM) -> pd.DataFrame: # Consider renaming this function to get_successful_twr_rangings().
     """ Get information about the successful twr transmissions
 
     Args:
@@ -533,10 +759,10 @@ def compute_twr_response_statistics(df: pd.DataFrame, timestamp_format: str = SI
             num_confirmed_responses = len(final_rx_df)
 
 
-            estimated_pos, pos_error, final_tx_ts = (None, None, None) # INIT
+            estimated_pos, pos_error, final_tx_ts = (None, None, None) # Initialize optional output fields.
             if (num_confirmed_responses>=MIN_ANCHORS_FOR_TWR):
                 estimated_pos, pos_error = _calc_twr_position(df_subset, node_id, poll_rx_df, resp_tx_df, final_rx_df, timestamp_format=timestamp_format)
-                final_tx_ts = df_subset.query("msgType == @FINAL")[timestamp_format].item()
+                final_tx_ts = df_subset.loc[df_subset["msgType"] == FINAL, timestamp_format].item()
 
             rows.append({
                 timestamp_format: final_tx_ts,
@@ -556,29 +782,52 @@ def compute_twr_response_statistics(df: pd.DataFrame, timestamp_format: str = SI
     return results_df
 
 def _calc_twr_position(confirmed_responses_df: pd.DataFrame, node_id: int, poll_rx_df: pd.DataFrame, resp_tx_df: pd.DataFrame, final_rx_df: pd.DataFrame, timestamp_format: str = SIM):
+    """ Estimate a node position from confirmed TWR anchor responses.
+
+    Args:
+        confirmed_responses_df (pd.DataFrame): Message subset containing confirmed responses for one node and sequence.
+        node_id (int): ID of the mobile node.
+        poll_rx_df (pd.DataFrame): Poll reception timestamps at anchors.
+        resp_tx_df (pd.DataFrame): Response transmission timestamps at anchors.
+        final_rx_df (pd.DataFrame): Final message reception timestamps at anchors.
+        timestamp_format (str): Timestamp column used for timing calculations.
+
+    Returns:
+        tuple[np.ndarray, float]: Estimated position and position error.
+    """
     confirmed_anchor_list = final_rx_df["NodeId"].unique().tolist()
-    poll_tx_ts = confirmed_responses_df.query("msgType == @POLL")[timestamp_format].item()
-    final_tx_ts = confirmed_responses_df.query("msgType == @FINAL")[timestamp_format].item() # Item throws error when it has more than one entry
+
+    poll_tx_ts = confirmed_responses_df.loc[confirmed_responses_df["msgType"] == POLL, timestamp_format].item()
+    final_tx_row = confirmed_responses_df.loc[confirmed_responses_df["msgType"] == FINAL].iloc[0]
+    final_tx_ts = final_tx_row[timestamp_format]
+
+    poll_rx_by_anchor = poll_rx_df.set_index("NodeId", drop=False)
+    resp_tx_by_anchor = resp_tx_df.set_index("NodeId", drop=False)
+    final_rx_by_anchor = final_rx_df.set_index("NodeId", drop=False)
+    resp_rx_by_anchor = confirmed_responses_df.loc[
+        (confirmed_responses_df["NodeId"] == node_id) &
+        (confirmed_responses_df["srcId"].isin(confirmed_anchor_list))
+    ].set_index("srcId", drop=False)
 
     ToFs = []
     anchor_positions = []
     for anchor_id in confirmed_anchor_list:
-        poll_rx_ts = poll_rx_df.query("NodeId == @anchor_id")[timestamp_format].item()
-        resp_tx_ts = resp_tx_df.query("NodeId == @anchor_id")[timestamp_format].item()
-        resp_rx_ts = confirmed_responses_df.query("srcId == @anchor_id and NodeId == @node_id")[timestamp_format].item()
-        final_rx_ts= final_rx_df.query("NodeId== @anchor_id")[timestamp_format].item()
+        poll_rx_ts = poll_rx_by_anchor.at[anchor_id, timestamp_format]
+        resp_tx_ts = resp_tx_by_anchor.at[anchor_id, timestamp_format]
+        resp_rx_ts = resp_rx_by_anchor.at[anchor_id, timestamp_format]
+        final_rx_ts = final_rx_by_anchor.at[anchor_id, timestamp_format]
 
-        anchor_position = tuple(final_rx_df.query("NodeId == @anchor_id")[["X", "Y", "Z"]].squeeze().tolist())
+        anchor_position = _get_position_from_record(final_rx_by_anchor.loc[anchor_id])
         anchor_positions.append(anchor_position)
         tof = calc_twr_tof(
-            R_a = (resp_rx_ts - poll_tx_ts),
-            R_b = (final_rx_ts - resp_tx_ts), 
-            D_a = (final_tx_ts - resp_rx_ts),
-            D_b = (resp_tx_ts - poll_rx_ts)
+            R_a=(resp_rx_ts - poll_tx_ts),
+            R_b=(final_rx_ts - resp_tx_ts),
+            D_a=(final_tx_ts - resp_rx_ts),
+            D_b=(resp_tx_ts - poll_rx_ts),
         )
         ToFs.append(tof)
 
-    node_position = confirmed_responses_df.query("msgType == @FINAL")[["X", "Y", "Z"]].squeeze().tolist()
+    node_position = _get_position_from_record(final_tx_row)
     estimated_pos = estimate_twr_position(anchor_positions, ToFs)
     pos_error = math.dist(node_position, estimated_pos)
 
@@ -598,6 +847,18 @@ def filter_df_for_localization_method(df: pd.DataFrame, method: str) -> pd.DataF
     return df_filtered
 
 def _get_twr_anchor_timestamps(df: pd.DataFrame, anchor_id_list: list, node_id: int,  rep: int, seq_no: int):
+    """ Extract anchor timestamps required for TWR time-of-flight calculation.
+
+    Args:
+        df (pd.DataFrame): Input dataframe containing all events.
+        anchor_id_list (list): Anchor IDs that responded to the poll.
+        node_id (int): ID of the mobile node.
+        rep (int): Experiment repetition.
+        seq_no (int): Sequence number of the TWR round.
+
+    Returns:
+        tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]: Poll reception, response transmission, and final reception dataframes.
+    """
 
     # for anchor_id in anchor_id_list:
     poll_rx_df = df[(df["NodeId"].isin(anchor_id_list)) &
@@ -644,9 +905,11 @@ def extract_data_from_csv(path: str):
         kv_pattern = re.findall(r'([^=,]+)=([^,\-]+)', dir_name)
         params = {}
         for key, value in kv_pattern:
+            # Check whether the value is an integer.
             if value.isdigit():
                 params[key] = int(value)
             else:
+                # Remove # characters from string values.
                 params[key] = value.replace("#", "")
 
         for file in directory.iterdir():
@@ -660,7 +923,7 @@ def extract_data_from_csv(path: str):
             csv_file["Node_Name"]    = file.name[:node_index]
             csv_file["Rep"] = int(re.search(r'rep(\d+)', file.name).group(1)) 
 
-            # dynamic parameter
+            # Add dynamic experiment parameters.
             for key, value in params.items():
                 csv_file[key] = value
 
@@ -673,6 +936,14 @@ def extract_data_from_csv(path: str):
 
 
 def set_node_and_src_is_anchor(df:pd.DataFrame):
+    """ Add boolean columns identifying whether the source and receiver are anchors.
+
+    Args:
+        df (pd.DataFrame): Input dataframe containing NodeId, srcId, and Node_Name columns.
+
+    Returns:
+        None: The dataframe is updated in place.
+    """
     num_anchors = get_num_nodes_by_name(df, "anchor") 
     df["src_is_anchor"]  = df["srcId"] <= num_anchors
     df["node_is_anchor"] = df["NodeId"] <= num_anchors
@@ -721,35 +992,39 @@ def get_num_nodes_by_name(df: pd.DataFrame, name: str) -> int:
 
 
 def calc_twr_tof(R_a, R_b, D_a, D_b):
+    """ Compute the TWR time of flight from round and delay timestamps.
+
+    Args:
+        R_a (float): First round duration at side A.
+        R_b (float): Second round duration at side B.
+        D_a (float): Reply delay at side A.
+        D_b (float): Reply delay at side B.
+
+    Returns:
+        float: Estimated one-way time of flight.
+    """
     numerator = R_a*R_b - D_a*D_b
     denominator = R_a + D_a + R_b + D_b
     tof = numerator/denominator
     return tof
 
 def estimate_twr_position(anchor_positions, ToFs, c=299792458.0):
-    """
-    Estimates the 3D position based on ToF measurements.
+    """ Estimate a 3D position from TWR time-of-flight measurements.
 
-    Parameters
-    ----------
-    anchor_positions : list of tuple
-        List of anchor coordinates [(x1,y1,z1), (x2,y2,z2), ...]
-    ToFs : list of float
-        ToF measurements in seconds (one-way) or already as distances
-    c : float
-        Signal propagation speed (default: speed of light in m/s)
+    Args:
+        anchor_positions (list): Anchor coordinates as tuples or arrays.
+        ToFs (list): One-way time-of-flight measurements in seconds.
+        c (float): Propagation speed used to convert time of flight into distances.
 
-    Returns
-    -------
-    np.ndarray
-        Estimated position [x, y, z]
+    Returns:
+        np.ndarray: Estimated 3D position.
     """
-    # Generated with AI
+    # ChatGPT generated
     anchors = np.array(anchor_positions, dtype=float)
-    distances = np.array(ToFs, dtype=float) * c  # ToF → Distanz
+    distances = np.array(ToFs, dtype=float) * c  # ToF to distance
 
     def residual(p, anchors, d):
-        """Differenz zwischen gemessenen Distanzen und berechneten Abständen"""
+        """Return the difference between modeled and measured distances."""
         return np.sqrt(((anchors - p)**2).sum(axis=1)) - d
 
     # Starting estimate at mean of all anchor positions
@@ -759,63 +1034,16 @@ def estimate_twr_position(anchor_positions, ToFs, c=299792458.0):
     return res.x
 
 
-def compute_inter_measurement_time(df: pd.DataFrame, filter_col, timestamp_col=SIM):
-    # Generated with AI
-    result = df.loc[df[filter_col].notna()].copy()
-    result["inter_measurement_time"] = result[timestamp_col].diff()
-    result["update_frequency"] = 1 / result["inter_measurement_time"]
-    return result.loc[result["inter_measurement_time"] > 0]
-
-
-def plot_ecdf(datasets: list[dict], xlabel="Position Error [m]", ylabel="CDF",
-              xlim=None, ylim=None, xticks=None, yticks=None, xscale=None, save_path: str = None):
-    """
-    datasets: list of dicts with keys:
-        - df: DataFrame
-        - x: column name to plot
-        - label: legend label
-        - filter_col: column to filter notna (optional, defaults to x)
-        - min_val: minimum value filter (optional, e.g. for inter_measurement_time > 0)
-    """
-    # Generated with AI
-    plt.figure()
-    linestyles = ["-", "--", "-.", ":", (0, (3, 1, 1, 1))]
-
-    for i, ds in enumerate(datasets):
-        filter_col = ds.get("filter_col", ds["x"])
-        df = ds["df"].loc[ds["df"][filter_col].notna()]
-        if "min_val" in ds:
-            df = df.loc[df[ds["x"]] > ds["min_val"]]
-        sns.ecdfplot(
-            data=df,
-            x=ds["x"],
-            label=ds["label"],
-            linestyle=linestyles[i % len(linestyles)]
-        )
-
-    plt.legend()
-    plt.xlabel(xlabel)
-    plt.ylabel(ylabel)
-    if xticks is not None:
-        plt.xticks(xticks)
-    if yticks is not None:
-        plt.yticks(yticks)
-    if xlim is not None:
-        plt.xlim(xlim)
-    if ylim is not None:
-        plt.ylim(ylim)
-    if xscale is not None:
-        plt.xscale(xscale)
-    plt.grid(True)
-
-    if save_path is not None:
-        Path("tmp/figs").mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().strftime("%y%m%d_%H%M")
-        plt.savefig(f"tmp/figs/{timestamp}_{save_path}.pdf", bbox_inches="tight")
-    plt.show()
-
-
 def filter_df(df:pd.DataFrame, filters: dict)->pd.DataFrame:
+    """ Filter a dataframe by exact-match column-value pairs.
+
+    Args:
+        df (pd.DataFrame): Input dataframe to filter.
+        filters (dict): Mapping from column names to required values.
+
+    Returns:
+        pd.DataFrame: Filtered dataframe view.
+    """
     mask = pd.Series(True, index=df.index)
     for col, val in filters.items():
         mask &= df[col] == val
@@ -824,13 +1052,36 @@ def filter_df(df:pd.DataFrame, filters: dict)->pd.DataFrame:
 
 
 def _expand_estimated_pos(df:pd.DataFrame, est_pos_column: str)->pd.DataFrame:
+    """ Expand a vector-valued estimated position column into x, y, and z columns.
+
+    Args:
+        df (pd.DataFrame): Input dataframe containing estimated positions.
+        est_pos_column (str): Column containing 3D position vectors.
+
+    Returns:
+        pd.DataFrame: Filtered dataframe with x_est, y_est, and z_est columns.
+    """
     df_notna = df.loc[df[est_pos_column].notna()].copy()
+    # positions
+    # df_notna["x_est"] = np.array(df_notna[est_pos_column].tolist())[:,0]
+    # df_notna["y_est"] = np.array(df_notna[est_pos_column].tolist())[:,1]
+    # df_notna["z_est"] = np.array(df_notna[est_pos_column].tolist())[:,2]
     arr = np.array(df_notna[est_pos_column].tolist())
     df_notna["x_est"], df_notna["y_est"], df_notna["z_est"] = arr[:,0], arr[:,1], arr[:,2]
     return df_notna
 
 
 def _compress_and_save_to_file(df: pd.DataFrame, file_name: str, filters: list[str]):
+    """ Save only rows containing selected result columns to a CSV file.
+
+    Args:
+        df (pd.DataFrame): Input dataframe to compress and save.
+        file_name (str): Output filename without extension.
+        filters (list[str]): Columns where at least one non-null value is required.
+
+    Returns:
+        pd.DataFrame: Filtered dataframe that was written to disk.
+    """
     mask = pd.Series(False, index=df.index)
     for filter in filters:
         mask |= df[filter].notna()
@@ -852,6 +1103,7 @@ def load_and_concat_results(methods: list, param_values: list, param_name: str, 
     
     Return: {TWR: df_alle_speeds, CENTRALIZED_SELF_LOC: df_alle_speeds, ...}
     """
+    # TODO: Improve this loading interface and reduce hard-coded filename conventions.
     method_dfs = {}
     for method in methods:
         dfs = []
@@ -868,32 +1120,17 @@ def load_and_concat_results(methods: list, param_values: list, param_name: str, 
     
     return method_dfs
 
-def load_results_from_csv(files: list, folder: str = "tmp", append_parameters: list = None, append_value: str= None)->pd.DataFrame:
-    data_list = []
-    pairs = zip(files, append_parameters) if append_parameters else ((f, None) for f in files)
-    for file, appendix in pairs:
-        file_path = Path(folder) / f"{file}.csv"
-        if not file_path.exists():
-            print(f"Warning: {file_path} not found, skipping.")
-            continue
-        data_df = pd.read_csv(file_path)
-        if append_parameters is not None and append_value:
-            data_df[append_value] = appendix
-        # Make residual column to array not string 
-        if "residuals" in data_df.columns:
-            data_df["residuals"] = data_df["residuals"].apply(
-                lambda x: np.fromstring(x.strip("[]"), sep=" ") if pd.notna(x) else None
-            )
-
-        data_list.append(data_df)
-    if not data_list:
-        return pd.DataFrame()
-
-    df = pd.concat(data_list, ignore_index=True)
-    print(f"Loaded {files} in {len(df)} Rows")
-
-    return df
 def remove_outliers_iqr(df: pd.DataFrame, col: str, factor: float = 1.5) -> pd.DataFrame:
+    """ Remove scalar outliers from one dataframe column using the IQR rule.
+
+    Args:
+        df (pd.DataFrame): Input dataframe containing the target column.
+        col (str): Column used for IQR-based filtering.
+        factor (float): IQR multiplier used to define lower and upper limits.
+
+    Returns:
+        pd.DataFrame: Filtered dataframe containing rows inside the IQR limits.
+    """
     q1  = df[col].quantile(0.25)
     q3  = df[col].quantile(0.75)
     iqr = q3 - q1
@@ -905,7 +1142,19 @@ def remove_outliers_iqr(df: pd.DataFrame, col: str, factor: float = 1.5) -> pd.D
 
 
 def compute_statistics(df: pd.DataFrame, method: str, timestamp_format = SIM, use_v_twr_pos: bool = True, save_to_file: bool = True, filter_dict: dict = {}):
+    """ Compute and optionally save statistics for one localization method and filter combination.
 
+    Args:
+        df (pd.DataFrame): Input dataframe already filtered to the selected method or parameter subset.
+        method (str): Localization method to process.
+        timestamp_format (str): Timestamp column used for timing calculations.
+        use_v_twr_pos (bool): Whether virtual TWR positions should be used for non-anchor nodes.
+        save_to_file (bool): Whether compressed result CSV files should be written.
+        filter_dict (dict): Parameter filter values used to build the output filename suffix.
+
+    Returns:
+        None: Results are written to disk when save_to_file is enabled.
+    """
     suffix = ""
     for key in filter_dict: 
         suffix += "_" + str(key) + "_" + str(filter_dict[key])
@@ -933,19 +1182,36 @@ def compute_statistics(df: pd.DataFrame, method: str, timestamp_format = SIM, us
 
 
 def _parse_parameter_list(parameter_string: str):
-    # Separate Elements with comma
+    """ Parse a command-line parameter specification into a parameter name and integer values.
+
+    Args:
+        parameter_string (str): Parameter string in the form name:v1,v2,v3.
+
+    Returns:
+        tuple[str, list[int]]: Parsed parameter name and list of integer values.
+    """
+    # Separate elements by comma.
     name_part, list_part = parameter_string.split(':')
     parameter_list = [int(x) for x in list_part.split(',')]
-    # Cast to int and put into list
+    # Cast values to integers and return them as a list.
     return (name_part, parameter_list)
 
 
 def parameter_validity_check(df: pd.DataFrame, experiment_parameter_arg):
+    """ Validate that requested experiment parameters exist in the dataframe.
+
+    Args:
+        df (pd.DataFrame): Input dataframe containing experiment parameters.
+        experiment_parameter_arg (list | None): Command-line parameter specifications.
+
+    Returns:
+        None: Raises an exception if a parameter is invalid.
+    """
     if experiment_parameter_arg is None: 
         return
     for experiment_parameter in experiment_parameter_arg:
         name, values = _parse_parameter_list(experiment_parameter)
-        # Exists Name?
+        # Check whether the parameter column exists.
         if name not in df.columns:
             raise Exception(f"Parameter {name} is not in the columns!")
         
@@ -955,39 +1221,23 @@ def parameter_validity_check(df: pd.DataFrame, experiment_parameter_arg):
         print(f"Column {name} exists and has entries that match with {values}")
 
 
-def filter_residual_outliers_globally(df: pd.DataFrame, residuals_column: str = "residuals", k: float = 3.0) -> pd.DataFrame:
-    df = df.copy()
-    
-    df_valid = df.loc[df[residuals_column].notna()].copy()
-    
-    # Flat all residuals for global MAD calculation
-    all_residuals = []
-    for r_list in df_valid[residuals_column]:
-        all_residuals.extend(np.ravel(r_list))
-    all_residuals = np.array(all_residuals)
-    
-    # Mean Absolute Deviation (MAD)
-    median = np.median(all_residuals)
-    mad = np.median(np.abs(all_residuals - median))
-    sigma_robust = 1.4826 * mad
-    
-    # Check row-wise: alle Residuals within k*sigma
-    keep_mask = df_valid[residuals_column].apply(
-        lambda r: np.all(np.abs(np.ravel(r) - median) <= k * sigma_robust)
-    )
-    
-    filtered_df = df_valid.loc[keep_mask].copy()
-    
-    n_total = len(df_valid)    
-    n_removed = n_total - len(filtered_df)
-    print(f"{residuals_column}: {n_removed} Outliers removed ({len(filtered_df)} of {n_total} valid rows remain)")
-    
-    return filtered_df
+
 
 def filter_residual_outliers_per_row(df: pd.DataFrame, residuals_column: str ="residuals", error_column: str="self_loc_error", k=3.0):
-    # Generated with AI
-    df = df.copy()
+    """ Filter residual outliers independently for each row using the median absolute deviation.
 
+    Args:
+        df (pd.DataFrame): Input dataframe containing residual vectors and error values.
+        residuals_column (str): Column containing residual vectors.
+        error_column (str): Column that must contain a valid localization error.
+        k (float): Robust sigma multiplier used as outlier threshold.
+
+    Returns:
+        pd.DataFrame: Filtered dataframe containing valid rows that passed the row-wise residual test.
+    """
+    df = df.copy()
+    
+    # Only consider rows with valid residuals and errors.
     valid_mask = df[residuals_column].notna() & df[error_column].notna()
     df_valid = df.loc[valid_mask].copy()
     
@@ -1010,6 +1260,7 @@ def filter_residual_outliers_per_row(df: pd.DataFrame, residuals_column: str ="r
     
     return filtered_df
 
+
 def filter_residual_outliers_per_parameter(
     df: pd.DataFrame,
     group_cols: list[str],
@@ -1017,11 +1268,22 @@ def filter_residual_outliers_per_parameter(
     k: float = 3.0,
     verbose: bool = True
 ) -> pd.DataFrame:
-    # Generated with AIChatGPT
+    """ Filter residual outliers within parameter groups using the median absolute deviation.
+
+    Args:
+        df (pd.DataFrame): Input dataframe containing residual vectors.
+        group_cols (list[str]): Columns used to define independent filtering groups.
+        residuals_column (str): Column containing residual vectors.
+        k (float): Robust sigma multiplier used as outlier threshold.
+        verbose (bool): Whether to print per-group and overall filtering statistics.
+
+    Returns:
+        pd.DataFrame: Dataframe with filtered residual rows and unchanged rows without residuals.
+    """
 
     df = df.copy()
 
-    # Split valid and others
+    # --- 1. Split rows with residuals from rows without residuals. ---
     valid_mask = df[residuals_column].notna()
     df_valid = df[valid_mask]
     df_other = df[~valid_mask]
@@ -1033,29 +1295,29 @@ def filter_residual_outliers_per_parameter(
 
     removed_per_group = []
 
-    # filter groups
+    # --- 2. Filter each group independently. ---
     for group_key, group in df_valid.groupby(group_cols):
 
         if len(group) == 0:
             removed_per_group.append((group_key, 0, 0))
             continue
 
-        # Collect residuals
+        # Collect residuals.
         all_residuals = np.hstack([np.ravel(row) for row in group[residuals_column]])
 
-        # robust statistics 
+        # Robust statistics.
         median = np.median(all_residuals)
         mad = np.median(np.abs(all_residuals - median))
         sigma_robust = 1.4826 * mad
 
-        # Check row
+        # Check rows.
         keep_mask = group[residuals_column].apply(
             lambda row: np.all(np.abs(np.ravel(row) - median) <= k * sigma_robust)
         )
 
         filtered_group = group.loc[keep_mask]
 
-        # Statistic
+        # Statistics.
         n_removed_group = len(group) - len(filtered_group)
         n_removed_total += n_removed_group
 
@@ -1063,12 +1325,12 @@ def filter_residual_outliers_per_parameter(
 
         filtered_dfs.append(filtered_group)
 
-    # Merge results
+    # --- 3. Concatenate filtered rows and unchanged rows. ---
     filtered_valid_df = pd.concat(filtered_dfs, ignore_index=True) if filtered_dfs else pd.DataFrame()
 
     final_df = pd.concat([filtered_valid_df, df_other], ignore_index=True)
 
-    # Output
+    # --- 4. Print summary. ---
     if verbose:
         print("\n--- Outlier Removal per Group ---")
         for group_key, n_valid, n_removed in removed_per_group:
@@ -1082,48 +1344,6 @@ def filter_residual_outliers_per_parameter(
         print(f"Final total rows: {len(final_df)}")
 
     return final_df
-
-
-
-def merge_exclusive_columns(
-    df: pd.DataFrame,
-    col1: str = "self_loc_error",
-    col2: str = "v_twr_error",
-    new_col: str = "hyrasel_pos_error"
-) -> pd.DataFrame:
-    """
-    Combines two mutually exclusive columns into a new column.
-
-    Args:
-        df: pd.DataFrame
-        col1: Name of the first column (default: "self_loc_error")
-        col2: Name of the second column (default: "vtwr_pos_error")
-        new_col: Name of the new column containing the merged values
-
-    Returns:
-        pd.DataFrame: Copy of the DataFrame with the new column
-
-    Raises:
-        TypeError: if df is not a pd.DataFrame
-        KeyError: if a column does not exist
-        ValueError: if both columns have values in the same row
-    """
-    # Generated with AI 
-
-    for col in [col1, col2]:
-        if col not in df.columns:
-            raise KeyError(f"Column '{col}' not found in DataFrame")
-
-    overlap_mask = df[col1].notna() & df[col2].notna()
-    if overlap_mask.any():
-        raise ValueError(
-            f"{overlap_mask.sum()} row(s) contain values in both '{col1}' and '{col2}'"
-        )
-
-    df = df.copy()
-    df[new_col] = df[col1].combine_first(df[col2])
-
-    return df
 
 # %%
 if __name__ == "__main__":
@@ -1158,7 +1378,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     
-    # !Mainly for data extraction!
+    # Mainly used for data extraction.
 
     # %%
     timestamp_format = args.timestamp_format
@@ -1171,14 +1391,24 @@ if __name__ == "__main__":
     print(f"Loaded Data from {experiment_path}")
     print(df)
 
+
+    # TODO: Add a command-line parameter for NOISE_SIGMA_T.
     NOISE_SIGMA_T = 300e-12 # 150 ps
-    # Add noise
-    noise = np.random.normal(
+
+    NOISE_SEED = 42
+    rng = np.random.default_rng(NOISE_SEED)
+    noise = rng.normal(
         loc=0.0,
         scale=NOISE_SIGMA_T,
         size=len(df)
     )
-
+    # # Add timestamp noise.
+    # noise = np.random.normal(
+    #     loc=0.0,
+    #     scale=NOISE_SIGMA_T,
+    #     size=len(df)
+    # )
+    # This mainly makes sense for clock timestamps.
     df["noisy_timestamp"] = df["clock_timestamp"] + noise
 
     if args.experiment_parameter is not None: 
@@ -1196,9 +1426,9 @@ if __name__ == "__main__":
     
 
     for method in args.method:  
-        method_df  = filter_df_for_localization_method(df, method).copy() 
+        method_df  = filter_df_for_localization_method(df, method).copy() # Can use filter_df() for this as well
 
-        # All possible combinations
+        # Process all parameter combinations.
 
         if not args.experiment_parameter: 
             print("No parameters provided (bc not necessary?)")
