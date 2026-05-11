@@ -112,46 +112,6 @@ These configurations evaluate:
 
 The generated simulation data is used as input for the post-processing pipeline.
 
-### Optional Command-Line Execution
-
-The simulations may also be runnable via `opp_run`, depending on the local OMNeT++ and INET setup.
-
-Example using `Cmdenv`:
-
-```bash
-cd omnetpp_code/localization/simulation
-
-opp_run \
-    -u Cmdenv \
-    -f omnetpp.ini \
-    -c Speed \
-    -n .:..:/path/to/inet/src
-```
-
-Example using `Qtenv`:
-
-```bash
-cd omnetpp_code/localization/simulation
-
-opp_run \
-    -u Qtenv \
-    -f omnetpp.ini \
-    -c Speed \
-    -n .:..:/path/to/inet/src
-```
-
-If INET or the project library needs to be loaded explicitly, add the appropriate `-l` arguments for your local installation.
-
-The exact command can be derived from the OMNeT++ IDE run configuration under:
-
-```text
-Run -> Run Configurations...
-```
-
-or from the IDE console output after launching a simulation.
-
-Refer to the OMNeT++ guides for more information. 
-
 ## Evaluation Pipeline
 
 The evaluation code is located in:
