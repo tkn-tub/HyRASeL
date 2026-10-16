@@ -1,0 +1,3 @@
+# Only files the image needs (the repository is mounted at runtime)
+*
+!evaluation/requirements.txt
