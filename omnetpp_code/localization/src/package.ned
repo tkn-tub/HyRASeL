@@ -1,3 +1,0 @@
-package localization;
-
-@license(LGPL);
