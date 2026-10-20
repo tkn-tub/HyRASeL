@@ -9,11 +9,25 @@ Simulation and evaluation code for the paper
 This repository contains the subset of our code base that is required to
 reproduce the results of the paper.
 
+## Structure
+
 ```text
-simulation/   OMNeT++ project: localization methods, writes CSV traces       (see simulation/README.md)
-evaluation/   Python: post-processing of the traces, statistics and figures (see evaluation/README.md)
-Makefile      Runs everything in a Docker container
-Dockerfile    Environment: OMNeT++ 6.2.0, INET 4.5.4, Python packages, tmux
+HyRASeL/
+├── simulation/                       OMNeT++ project (see simulation/README.md)
+│   ├── src/                          Source code
+│   └── simulations/
+│       ├── omnetpp.ini               Simulation configs
+│       └── results/traces/<Config>/  Output: simulation traces (CSV)
+├── evaluation/                       Python: post-processing, statistics, figures (see evaluation/README.md)
+│   ├── configs/<Config>.yml          Evaluation configs
+│   ├── src/                          Scripts
+│   ├── tests/                        Unit tests
+│   └── results/<Config>/             Output: evaluation results
+├── figures/                          Output: figures of the paper (make paper)
+├── logs/                             Output: logs
+├── Makefile                          Runs everything in a Docker container
+├── Dockerfile                        Environment: OMNeT++ 6.2.0, INET 4.5.4, Python packages, tmux
+└── container.sh                      Runs make in tmux inside the container (used by the Makefile)
 ```
 
 ## Reproducing the Results with Docker
@@ -49,15 +63,8 @@ make evaluation  CONFIG=Baseline   # postprocess + plots
 ```
 
 `make help` lists all targets and options, e.g. `JOBS=<n>` for the number of
-parallel simulation runs and post-processing jobs. All outputs are written to
-this directory:
-
-| Output                 | Directory                                    |
-| ---------------------- | -------------------------------------------- |
-| Simulation traces      | `simulation/simulations/results/traces/<Config>/` |
-| Evaluation results     | `evaluation/results/<Config>/`               |
-| Figures of the paper   | `figures/` (`make paper`)                    |
-| Logs                   | `logs/`                                      |
+parallel simulation runs and post-processing jobs. The outputs are listed in
+the [structure](#structure).
 
 Every simulation config in `simulation/simulations/omnetpp.ini` has an
 evaluation config with the same name in `evaluation/configs/`. The scenario is
@@ -110,6 +117,10 @@ The simulation can also be imported into the OMNeT++ IDE (see [simulation/README
 Parts of the code and the documentation were written or revised with the
 assistance of AI models (OpenAI ChatGPT, Anthropic Claude). All of it was
 reviewed by the authors.
+
+## Contact
+
+Simon Schmitz-Heinen, [schmitz-heinen@ccs-labs.org](mailto:schmitz-heinen@ccs-labs.org)
 
 ## License
 
