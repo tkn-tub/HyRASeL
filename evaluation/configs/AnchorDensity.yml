@@ -1,0 +1,5 @@
+# Effect of the anchor density (inter-anchor distance).
+sweep:
+  interAnchorDist: [130, 150, 170, 190, 210, 230, 250, 270]
+plots:
+  plots: [coverage, opportunities]

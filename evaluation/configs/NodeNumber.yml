@@ -1,0 +1,5 @@
+# Effect of the number of nodes.
+sweep:
+  numNodes: [4, 9, 16, 25, 36, 49]
+plots:
+  plots: [coverage]

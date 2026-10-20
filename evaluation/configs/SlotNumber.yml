@@ -1,0 +1,8 @@
+# Effect of the number of v-anchor slots per sequence (only HyRASeL uses them).
+methods: [CENTRALIZED]
+sweep:
+  numSlots: [2, 3, 4, 5, 6]
+plots:
+  plots: [coverage, error_by_technique]
+  # Half column width: both figures next to each other in one column of the paper.
+  width: {coverage: 0.5, error_by_technique: 0.5}

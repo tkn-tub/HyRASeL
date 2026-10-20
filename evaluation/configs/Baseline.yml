@@ -1,0 +1,3 @@
+# Default scenario without sweep parameter (all methods in one setting).
+plots:
+  plots: [error_ecdf, coverage_time, availability_cdf]

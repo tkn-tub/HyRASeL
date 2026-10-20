@@ -1,0 +1,7 @@
+# Effect of the message loss probability on anchor-node links.
+sweep:
+  anchorNodeLoss: [0, 0.1, 0.2, 0.3, 0.4, 0.5]
+plots:
+  plots: [coverage, availability_q10]
+  # Half column width: both figures next to each other in one column of the paper.
+  width: {coverage: 0.5, availability_q10: 0.5}

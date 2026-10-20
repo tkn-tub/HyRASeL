@@ -1,0 +1,19 @@
+# Simulation output
+simulations/results/
+
+
+simulations/Makefile.*
+# Build output
+out/
+src/Makefile
+**_m.cc
+**_m.h
+**.so
+
+# IDE files (except the project description)
+.*
+!.gitignore
+!.project
+!.cproject
+!.oppbuildspec
+!.nedfolders

@@ -1,0 +1,66 @@
+# Defaults for all evaluation configs (configs/<Config>.yml, named like the
+# config in simulation/simulations/omnetpp.ini).
+# A config only needs the entries that differ from these defaults; nested
+# sections are merged key by key.
+#
+# The sections postprocess / extract / plots are passed 1:1 as command-line
+# arguments to the respective script:
+#   key: value  -> --key value       key: true   -> --key
+#   key: [a, b] -> --key a b         false/null  -> omitted
+#   key: {a: x, b: y} -> --key a=x b=y
+# Spell keys exactly like the script's option (underscores or dashes).
+
+# Raw traces are read from <data_root>/<Config>/ (relative to the evaluation
+# directory); results go to results/<Config>/.
+data_root: ../simulation/simulations/results/traces
+
+methods: [TWR, CENTRALIZED, HYPERBOLIC_SELF_LOCALIZATION]
+reps: "0-19"
+# Max. parallel post-processing jobs (limits CPU and memory use; override with make JOBS=n).
+jobs: 4
+# true: one post-processing job per method x sweep value x rep (most
+# parallelism); false: one job per method x sweep value, reps run in sequence.
+split_reps: true
+
+postprocess:          # src/post_processing.py
+  use_vtwr_pos: true
+  timestamp_format: noisy_timestamp
+  tdoa_solver_profile: robust
+  tdoa_dimension: auto
+  tdoa_loss: huber
+
+# Statistics and figures go to results/<Config>/<estimator>/<filter_profile>/:
+# estimator is tdoa_loss (legacy for tdoa_solver_profile: legacy), the filter
+# profile is named after the extract options, e.g. hdop-2_mad-3_stitch_all-ref.
+extract:              # src/extract_statistics.py
+  coverage-window-size: 0.04   # [s]
+  error-dimension: 2d          # 2d: DOP filter on HDOP, 3d: on PDOP
+  pdop-max: 2.0
+  residual-mad-max: 3.0
+  use-anchor-stitching: true
+  localization-methods: [self_loc, v_twr, twr]
+
+plots:                # src/plot_parameter_sweeps.py
+  format: pdf
+  # Methods shown in the figures, in legend order. Post-processing and
+  # extraction still run for all `methods` above. <METHOD>.v_twr is the v-TWR
+  # part of a method as its own line (only error_by_technique,
+  # interval_by_technique and error_ecdf). A config replaces this list as a whole.
+  methods: [CENTRALIZED, CENTRALIZED.v_twr, TWR, HYPERBOLIC_SELF_LOCALIZATION]
+  # Width of single line plots as a fraction of the column width, e.g.
+  # width: {coverage: 0.5, availability_q10: 0.5} for two separate figures next
+  # to each other in one column (include with width=0.5\columnwidth).
+  # Default: full column width.
+  # Display names; a config only lists the names it changes. Colors and line
+  # styles belong to the method, not to its name.
+  method-labels:
+    CENTRALIZED: "HyRASeL"
+    CENTRALIZED.v_twr: "v-TWR"
+    DISTRIBUTED: "HyRASeL (Distr.)"
+    DISTRIBUTED.v_twr: "v-TWR (Distr.)"
+    TWR: "TWR (Baseline)"
+    HYPERBOLIC_SELF_LOCALIZATION: "Chiasson et al. (Baseline)"
+  # Moving average of coverage-over-time plots [s]: about 6 coverage windows
+  # and 5 % of the shortest simulation; legend numbers use unsmoothed data.
+  smoothing-window: 0.25
+  ecdf-mode: separate          # combined, separate or both

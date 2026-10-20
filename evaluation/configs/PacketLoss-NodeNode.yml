@@ -1,0 +1,5 @@
+# Effect of the message loss probability on node-node links.
+sweep:
+  nodeNodeLoss: [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+plots:
+  plots: [coverage]
