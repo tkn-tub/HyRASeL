@@ -11,5 +11,6 @@ namespace localization;
 
 class ReceptionTimingInd extends inet::TagBase
 {
-    simtime_t startRxTime;
+    simtime_t startRxTime;  // INET propagation start plus an optional PHY-specific excess delay
+    simtime_t excessDelay;  // Additional channel delay already included in startRxTime
 }

@@ -2,10 +2,12 @@
 # The Docker image is built automatically when needed.
 #
 #   make paper                        Simulate and evaluate all configs of the paper, figures -> figures/
+#   make paper-fast                   As paper with 2 repetitions instead of 20 (quick check; REPS=<n> to change)
 #   make simulation  [CONFIG=<name>]  OMNeT++ simulation                  -> simulation/simulations/results/traces/
 #   make postprocess [CONFIG=<name>]  Post-processing (localization)      -> evaluation/results/<Config>/postprocessed/
 #   make plots       [CONFIG=<name>]  Filtering, statistics and figures   -> evaluation/results/<Config>/<estimator>/<filter>/
 #   make evaluation  [CONFIG=<name>]  postprocess + plots
+#   make full        [CONFIG=<name>]  simulation + evaluation
 # Without CONFIG, all configs of the paper are used. The scenario is configured in
 # simulation/simulations/omnetpp.ini, the evaluation in evaluation/configs/<Config>.yml.
 #
@@ -18,6 +20,7 @@
 # Options:
 #   CONFIG=<name>  Config of simulation/simulations/omnetpp.ini and evaluation/configs/
 #   JOBS=<n>       Parallel simulation runs / post-processing jobs (default: 8 / 4)
+#   REPS=<n>       Number of repetitions (default: repeat in omnetpp.ini, reps in evaluation/configs/)
 #   NAME=<name>    Container name (default: hyrasel), e.g. to run several at the same time
 
 # Configs evaluated in the paper
@@ -29,23 +32,25 @@ IMAGE  := hyrasel-env
 
 DOCKER_ARGS := --user "$$(id -u):$$(id -g)" -e HOME=/tmp -v "$(CURDIR)":/work -w /work
 
-.PHONY: help paper simulation postprocess plots evaluation attach logs stop shell image _start _simulation _postprocess _plots _figures
+.PHONY: help paper paper-fast simulation postprocess plots evaluation full attach logs stop shell image _start _simulation _postprocess _plots _figures
 
 help:
-	@sed -n '2,22s/^# \{0,1\}//p' Makefile
+	@sed -n '2,/^$$/s/^# \{0,1\}//p' Makefile
 
 paper:       ; @$(MAKE) --no-print-directory _start TARGET="_simulation _postprocess _plots _figures CONFIG='$(PAPER_CONFIGS)'"
+paper-fast:  ; @$(MAKE) --no-print-directory paper REPS=$(or $(REPS),2)
 simulation:  ; @$(MAKE) --no-print-directory _start TARGET="_simulation CONFIG='$(CONFIG)'"
 postprocess: ; @$(MAKE) --no-print-directory _start TARGET="_postprocess CONFIG='$(CONFIG)'"
 plots:       ; @$(MAKE) --no-print-directory _start TARGET="_plots CONFIG='$(CONFIG)'"
 evaluation:  ; @$(MAKE) --no-print-directory _start TARGET="_postprocess _plots CONFIG='$(CONFIG)'"
+full:        ; @$(MAKE) --no-print-directory _start TARGET="_simulation _postprocess _plots CONFIG='$(CONFIG)'"
 
 # Start TARGET of this Makefile in a container in the background
 _start: image
 	@if docker ps -q -f name='^$(NAME)$$' | grep -q .; then \
 		echo "Container '$(NAME)' is already running: make attach / make stop, or choose another NAME=<name>" >&2; exit 1; fi
 	@mkdir -p logs
-	@docker run -d --rm --name $(NAME) $(DOCKER_ARGS) $(IMAGE) ./container.sh logs/$(NAME).log $(TARGET) $(if $(JOBS),JOBS=$(JOBS)) > /dev/null
+	@docker run -d --rm --name $(NAME) $(DOCKER_ARGS) $(IMAGE) ./container.sh logs/$(NAME).log $(TARGET) $(if $(JOBS),JOBS=$(JOBS)) $(if $(REPS),REPS=$(REPS)) > /dev/null
 	@echo "Started in container '$(NAME)': make attach (watch), make logs (log), make stop (abort)"
 
 attach:
@@ -69,15 +74,20 @@ image:
 
 # --- Run inside the container -----------------------------------------------------
 
+# REPS repetitions in the syntax of the simulation (overrides repeat in omnetpp.ini)
+# and of the evaluation (rep range 0..REPS-1)
+SIM_REPS  = $(if $(REPS),REPEAT=$(REPS))
+EVAL_REPS = $(if $(REPS),REPS=0-$(shell echo $$(($(REPS) - 1))))
+
 _simulation:
 	$(MAKE) -C simulation makefiles all
-	@for config in $(CONFIG); do $(MAKE) -C simulation run CONFIG=$$config || exit 1; done
+	@for config in $(CONFIG); do $(MAKE) -C simulation run CONFIG=$$config $(SIM_REPS) || exit 1; done
 
 _postprocess:
-	$(MAKE) -C evaluation postprocess CONFIG="$(patsubst %,configs/%.yml,$(CONFIG))"
+	$(MAKE) -C evaluation postprocess CONFIG="$(patsubst %,configs/%.yml,$(CONFIG))" $(EVAL_REPS)
 
 _plots:
-	$(MAKE) -C evaluation analyze CONFIG="$(patsubst %,configs/%.yml,$(CONFIG))"
+	$(MAKE) -C evaluation analyze CONFIG="$(patsubst %,configs/%.yml,$(CONFIG))" $(EVAL_REPS)
 
 # Collect the figures of all configs
 _figures:

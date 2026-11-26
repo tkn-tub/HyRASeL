@@ -4,10 +4,13 @@ Simulation and evaluation code for the paper
 
 > **HyRASeL: Hybrid UWB Two-Way-Ranging and Asynchronous Hyperbolic Self-Localization**
 > Simon Schmitz-Heinen, Anatolij Zubow, Tehmina Bibi, Falko Dressler
-> Submitted to IEEE/IFIP WONS 2027
+> Accepted at IEEE/IFIP WONS 2027
 
 This repository contains the subset of our code base that is required to
-reproduce the results of the paper.
+reproduce the results of the paper. Code and figures use the terms of the
+camera-ready version, t-Anchor (temporary anchor) and t-TWR (t-Anchor two-way
+ranging); the submitted version (tag `wons2027submission`) called them
+v-Anchor and v-TWR.
 
 ## Structure
 
@@ -34,17 +37,22 @@ HyRASeL/
 
 Requires only [Docker](https://docs.docker.com/engine/install/) (usable
 without `sudo`, i.e. as a member of the group `docker`) and `make`, and about
-20 GB of free disk space for the simulation traces. The Docker image is built
-automatically on first use (about 10 minutes). Tested on Linux (x86-64); on
-macOS and Windows (WSL 2), Docker Desktop should work but was not tested.
+105 GB of free disk space (simulation traces about 20 GB, evaluation results
+about 85 GB). The Docker image is built automatically on first use (about 10
+minutes). Tested on Linux (x86-64); on macOS and Windows (WSL 2), Docker
+Desktop should work but was not tested.
 
 ```sh
 git clone https://github.com/tkn-tub/HyRASeL.git && cd HyRASeL
 make paper        # simulate and evaluate all configs of the paper
+make paper-fast   # the same with 2 instead of 20 repetitions (quick check)
 ```
 
 This starts a container in the background and returns. The run continues
-when the terminal is closed:
+when the terminal is closed. `make paper` takes about 8 hours with
+`JOBS=20` on a 24-core machine, most of it for the post-processing;
+`make paper-fast` needs about a tenth of the time and disk space, so it also
+runs on a laptop. Its figures show the same trends with more noise.
 
 ```sh
 make attach       # watch the progress (tmux; detach with Ctrl-b d)
@@ -60,11 +68,12 @@ make simulation  CONFIG=Baseline   # OMNeT++ simulation
 make postprocess CONFIG=Baseline   # post-processing (localization)
 make plots       CONFIG=Baseline   # filtering, statistics and figures
 make evaluation  CONFIG=Baseline   # postprocess + plots
+make full        CONFIG=Baseline   # simulation + evaluation
 ```
 
 `make help` lists all targets and options, e.g. `JOBS=<n>` for the number of
-parallel simulation runs and post-processing jobs. The outputs are listed in
-the [structure](#structure).
+parallel simulation runs and post-processing jobs, or `REPS=<n>` for the
+number of repetitions. The outputs are listed in the [structure](#structure).
 
 Every simulation config in `simulation/simulations/omnetpp.ini` has an
 evaluation config with the same name in `evaluation/configs/`. The scenario is
@@ -76,7 +85,7 @@ Configs of the paper:
 
 | Figure in the paper                                   | Config                  |
 | ----------------------------------------------------- | ----------------------- |
-| Effect of the number of v-Anchor slots                | `SlotNumber`            |
+| Effect of the number of t-Anchor slots                | `SlotNumber`            |
 | Comparison with the baseline methods                  | `Baseline`              |
 | Effect of the inter-anchor distance                   | `AnchorDensity`         |
 | Effect of the number of nodes                         | `NodeNumber`            |

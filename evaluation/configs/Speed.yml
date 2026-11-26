@@ -2,4 +2,7 @@
 sweep:
   speed: [5, 10, 25, 50]
 plots:
-  plots: [error_by_technique]
+  figures:
+    error:
+      type: line
+      metric: mean_error

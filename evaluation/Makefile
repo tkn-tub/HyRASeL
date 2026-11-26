@@ -19,6 +19,7 @@ PIPELINE := $(PYTHON) src/pipeline.py
 CONFIGS  := $(filter-out configs/defaults.yml,$(wildcard configs/*.yml))
 STEPS    := postprocess extract plots analyze full
 
+# Options of pipeline.py for the overrides that are set; unset ones are omitted.
 OPTIONS := $(if $(JOBS),--jobs $(JOBS)) \
            $(if $(REPS),--reps $(REPS)) \
            $(if $(METHODS),--methods $(METHODS)) \
@@ -37,13 +38,16 @@ help:
 	@echo "Configs: $(notdir $(basename $(CONFIGS)))"
 	@echo "See the header of this Makefile for optional overrides."
 
+# make <step> CONFIG=...: $@ is the step.
 $(STEPS):
 	@test -n "$(CONFIG)" || { echo "Missing CONFIG=configs/<name>.yml"; exit 1; }
 	$(PIPELINE) $@ $(CONFIG) $(OPTIONS)
 
+# make <step>-all: $(@:-all=) strips the suffix, e.g. full-all -> full.
 $(addsuffix -all,$(STEPS)):
 	$(PIPELINE) $(@:-all=) $(CONFIGS) $(OPTIONS)
 
+# make <step>-<Config>: $* is the config name.
 postprocess-%: ; $(PIPELINE) postprocess configs/$*.yml $(OPTIONS)
 extract-%:     ; $(PIPELINE) extract configs/$*.yml $(OPTIONS)
 plots-%:       ; $(PIPELINE) plots configs/$*.yml $(OPTIONS)

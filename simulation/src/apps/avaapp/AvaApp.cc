@@ -94,7 +94,7 @@ void AvaApp::initializeLocalization(){
 }
 
 void AvaApp::initializeDistributedSelectionSelfLoc(){
-    totalNumSlots = numAnchors + numVAnchorSlots;
+    totalNumSlots = numAnchors + numTAnchorSlots;
     if (isAnchor){
         scheduleTimersAfterSlots(selfLocTxTimer, selfLocTxTimer_c , nodeId, startTime, startTime_c);
     }
@@ -105,7 +105,7 @@ void AvaApp::initializeDistributedSelectionSelfLoc(){
 }
 
 void AvaApp::initializeCentralizedSelectionSelfLoc(){
-    totalNumSlots = numAnchors + numVAnchorSlots;
+    totalNumSlots = numAnchors + numTAnchorSlots;
     if (isAnchor){
         scheduleTimersAfterSlots(selfLocTxTimer, selfLocTxTimer_c , nodeId, startTime, startTime_c);
     }
@@ -134,6 +134,7 @@ void AvaApp::handleMessageWhenUp(cMessage *msg) {
     }
 
     // If message arrives on the TWR interface, handle it
+    // TODO(refactor): use check_and_cast; the branch below deletes msg and still uses it
     auto packet = dynamic_cast<Packet*>(msg);
     ASSERT(packet);
     if (!packet){
@@ -217,7 +218,8 @@ void AvaApp::handlePacket(Packet *pkt){
     rxTimestamps_c[interfaceIdx] = computeClockTimeFromSimTime(
         rxTimestamps[interfaceIdx]);
     EV_INFO << "Rx packet over interface " << interfaceIdx << endl;
-    EV_INFO << "Timestamp on interface " << rxTimestamps[interfaceIdx] << endl;
+    EV_INFO << "Timestamp on interface " << rxTimestamps[interfaceIdx]
+            << " (excess delay " << timing->getExcessDelay() << ")" << endl;
 
     // Receiving message; writing it into file
     writeToResultFile(rxTimestamps[interfaceIdx], rxTimestamps_c[interfaceIdx], info.seqNo, info.srcId, info.destId, info.msgType, info.interfaceIdx);
@@ -271,12 +273,12 @@ void AvaApp::handleCentralizedSelectionSelfLocPacket(const AvaPacketInfo& info){
     if (info.srcIsAnchor && (nodeId == info.contId) && !selectedNodeTxTimerIsScheduled){
         // SCHEDULE selectedNodeTxTimer
         EV_INFO << "Selected as node! Scheduling transmission" << endl;
-        int waitingSlots = numAnchors - info.srcId;
-        scheduleTimersAfterSlots(selectedNodeTxTimer, selectedNodeTxTimer_c, waitingSlots);
+        // Slots counted from the start of the received slot, hence +1
+        int waitingSlots = numAnchors - info.srcId + 1;
+        scheduleTimersAfterRxSlotStart(selectedNodeTxTimer, selectedNodeTxTimer_c, waitingSlots, info.interfaceIdx);
     }
 
 }
-
 
 void AvaApp::handleDistributedSelectionSelfLocPacket(const AvaPacketInfo& info){
     // ANCHOR LOGIC
@@ -289,7 +291,7 @@ void AvaApp::handleDistributedSelectionSelfLocPacket(const AvaPacketInfo& info){
     updateSequenceNumberCounter(info);
     updateLocalSequenceNumber(info);
     bool srcOverheardOtherNode = (info.contId !=nodeId);
-    bool contentionWasSuccessful = (vAnchorTxCounter != 1);
+    bool contentionWasSuccessful = (tAnchorTxCounter != 1);
     bool succContTimerIsScheduled = (succContTimer->isScheduled() || succContTimer_c->isScheduled());
     // Not eligible for further transmission if some node overheard another node
     // Timer must be scheduled, transmitter must be anchor and contentionId is neither our ID nor -1, then we cancel
@@ -309,9 +311,10 @@ void AvaApp::handleTwrPacket(Packet *pkt, const AvaPacketInfo& info){
     // ANCHOR LOGIC
     if (isAnchor){
         if ((info.msgType == POLL)){
-            int numSlots = nodeId-1;
+            // Anchor k answers k slots after the start of the POLL slot
+            int numSlots = nodeId;
             currentPkt = pkt->dup();
-            scheduleTimersAfterSlots(txTimer, txTimer_c, numSlots);
+            scheduleTimersAfterRxSlotStart(txTimer, txTimer_c, numSlots, info.interfaceIdx);
         }
         return;
     }
@@ -319,22 +322,18 @@ void AvaApp::handleTwrPacket(Packet *pkt, const AvaPacketInfo& info){
     // NODE LOGIC
     updateLocalSequenceNumber(info);
     bool txTimerScheduled = txTimer->isScheduled() || txTimer_c->isScheduled();
-    // Only one FINAL per POLL round: a RESPONSE whose reception ends at exactly the same
-    // simTime as the txTimer fires is still delivered (zero-delay send chain) and must not
-    // trigger a second FINAL while the first one is being transmitted.
-    bool finalAlreadyScheduledForRound = (info.seqNo == lastFinalTwrSeqNo);
-    if (!txTimerScheduled && !finalAlreadyScheduledForRound && (info.msgType == RESPONSE)){
-        lastFinalTwrSeqNo = info.seqNo;
-        int numSlots = numAnchors - info.srcId;
+    if (!txTimerScheduled && (info.msgType == RESPONSE)){
+        // Slots counted from the start of the received slot, hence +1
+        int numSlots = numAnchors - info.srcId + 1;
         currentPkt = pkt->dup();
-        scheduleTimersAfterSlots(txTimer, txTimer_c, numSlots);
+        scheduleTimersAfterRxSlotStart(txTimer, txTimer_c, numSlots, info.interfaceIdx);
     }
 }
 
 void AvaApp::updateSequenceNumberCounter(const AvaPacketInfo& info){
 
-     //  If the sequenceNumber (from a real Anchor) is new, we reset the counter
-     if (info.seqNo != prevSeqNo && info.srcIsAnchor){
+     //  If the sequenceNumber (from a real Anchor) is newer, we reset the counter
+     if (info.seqNo > prevSeqNo && info.srcIsAnchor){
          prevSeqNo = info.seqNo;
          seqNoCounter = 0;
          // Clean heardAnchors set, as we have a new sequenceNumber
@@ -343,10 +342,12 @@ void AvaApp::updateSequenceNumberCounter(const AvaPacketInfo& info){
          EV << "HeardAnchorsSet Size after clearing: " << heardAnchors.size() << endl;
       }
 
-     // Update for both, v-Anchors and static anchors
-     auto [iterator, inserted] = heardAnchors.insert(info.srcId);
-     if (inserted){
-          seqNoCounter++;
+     // Count only the static anchors of the current sequence (no t-anchors, no older seqNo)
+     if (info.srcIsAnchor && info.seqNo == prevSeqNo){
+         auto [iterator, inserted] = heardAnchors.insert(info.srcId);
+         if (inserted){
+              seqNoCounter++;
+         }
      }
      EV << "Current HeardAnchorsSet Size: " << heardAnchors.size() << endl;
      EV << "Current seqNoCounter Size: " << seqNoCounter << endl;
@@ -355,9 +356,9 @@ void AvaApp::updateSequenceNumberCounter(const AvaPacketInfo& info){
 
 
 void AvaApp::updateContendingNode(const AvaPacketInfo& info){
-    // vAnchors sets contId to current counter; thus is not -1
-    bool srcIsNotVAnchor = (info.contId == -1);
-    if (!info.srcIsAnchor && srcIsNotVAnchor){ // Done only by anchors
+    // tAnchors sets contId to current counter; thus is not -1
+    bool srcIsNotTAnchor = (info.contId == -1);
+    if (!info.srcIsAnchor && srcIsNotTAnchor){ // Done only by anchors
         contendingNode = info.srcId ;
     }
 }
@@ -392,25 +393,25 @@ void AvaApp::rescheduleAllClocksIfNeeded(const AvaPacketInfo& info){
         return;
     }
     // Not used in the paper (useRescheduling = false)
-    int srcVAnchorSlot = ((info.contId == -1) ? 0 : info.contId); // calculated for node and anchor, but only node is relevant
+    int srcTAnchorSlot = ((info.contId == -1) ? 0 : info.contId); // calculated for node and anchor, but only node is relevant
 
     if(selfLocTxTimer_c->isScheduled() && useRescheduling){ // Only done by anchors
         int remainingSlots = (info.srcIsAnchor
                 ? ((totalNumSlots + nodeId - info.srcId - 1) % totalNumSlots)
-                : ((totalNumSlots + nodeId - (numAnchors + srcVAnchorSlot + 1) -1) % totalNumSlots));
+                : ((totalNumSlots + nodeId - (numAnchors + srcTAnchorSlot + 1) -1) % totalNumSlots));
         rescheduleClockTimer(selfLocTxTimer_c, remainingSlots);
     }
 
     if(contentionTimer_c->isScheduled() && useRescheduling){ // Only done by nodes
-        int remainingSlots =  (info.srcIsAnchor ? (numAnchors - info.srcId) : (totalNumSlots - srcVAnchorSlot - 1));
+        int remainingSlots =  (info.srcIsAnchor ? (numAnchors - info.srcId) : (totalNumSlots - srcTAnchorSlot - 1));
         rescheduleClockTimer(contentionTimer_c, remainingSlots);
     }
 
     if(succContTimer_c->isScheduled() && useRescheduling){ // only done by nodes
-        ASSERT(vAnchorTxCounter==-1);
+        ASSERT(tAnchorTxCounter==-1);
         int remainingSlots = (info.srcIsAnchor
-                ? (numAnchors - info.srcId + vAnchorTxCounter)
-                : ((vAnchorTxCounter - srcVAnchorSlot -1 + totalNumSlots) % totalNumSlots)); // + totalNumSlots keeps the result of % non-negative
+                ? (numAnchors - info.srcId + tAnchorTxCounter)
+                : ((tAnchorTxCounter - srcTAnchorSlot -1 + totalNumSlots) % totalNumSlots)); // + totalNumSlots keeps the result of % non-negative
         rescheduleClockTimer(succContTimer_c, remainingSlots);
     }
 }
@@ -465,7 +466,7 @@ void AvaApp::handleContentionTimer(){
         return;
     }
 
-     if (!overheardSufficientAnchors()){
+     if (checkSufficientAnchors && !overheardSufficientAnchors()){
          EV_INFO << "Not contending as not sufficiently many anchors overheard" << endl;
          return;
      }
@@ -474,21 +475,21 @@ void AvaApp::handleContentionTimer(){
     // Transmit packet if chance is good
     EV << "Transmitting! (all checks passed)" << endl;
     sendAvaPacket(selfLocSeqNo, nodeId, 0xFF, SELF_LOC);
-    vAnchorTxCounter = 1;
-    scheduleTimersAfterSlots(succContTimer, succContTimer_c, totalNumSlots+vAnchorTxCounter);
+    tAnchorTxCounter = 1;
+    scheduleTimersAfterSlots(succContTimer, succContTimer_c, totalNumSlots+tAnchorTxCounter);
 }
 
 void AvaApp::handleSuccessfulContentionTimer(){
-    // vAnchorTxCounter is transmitted as contId to indicate that this is not the contention slot
+    // tAnchorTxCounter is transmitted as contId to indicate that this is not the contention slot
     EV_INFO << "Contention was successful; Transmitting next message in slot ";
 
-    sendAvaPacket(selfLocSeqNo, nodeId, 0xFF, SELF_LOC, vAnchorTxCounter);
+    sendAvaPacket(selfLocSeqNo, nodeId, 0xFF, SELF_LOC, tAnchorTxCounter);
 
-    vAnchorTxCounter++;
-    EV_INFO << vAnchorTxCounter << endl;
-    if (vAnchorTxCounter == numVAnchorSlots){
-        EV_INFO << "Reached vAnchor Transmission Limit!" << endl;
-        vAnchorTxCounter = -1;
+    tAnchorTxCounter++;
+    EV_INFO << tAnchorTxCounter << endl;
+    if (tAnchorTxCounter == numTAnchorSlots){
+        EV_INFO << "Reached tAnchor Transmission Limit!" << endl;
+        tAnchorTxCounter = -1;
         return;
     }
 
@@ -498,20 +499,27 @@ void AvaApp::handleSuccessfulContentionTimer(){
 
 void AvaApp::handleSelectedNodeTxTimer(){
 
-    // sufficientlyAnchors CONDITION?
-    if (!overheardSufficientAnchors()){
+    // Only the first t-anchor slot requires sufficiently many overheard anchors (checkSufficientAnchors);
+    // a node that transmitted also uses the further slots (with log-normal shadowing, an anchor that
+    // the node did not hear in one round may still receive the node's message)
+    if (tAnchorTxCounter == -1 && checkSufficientAnchors && !overheardSufficientAnchors()){
          EV_INFO << "Not transmitting as not sufficiently many anchors were overheard ("<< seqNoCounter << ")!" << endl;
-         vAnchorTxCounter = -1;
+         tAnchorTxCounter = -1;
          return;
      }
 
-    vAnchorTxCounter++;
+    tAnchorTxCounter++;
+    // Further t-anchor slots lie in the following sequences, also if their anchors were not heard
+    if (tAnchorTxCounter == 0)
+        tAnchorFirstSeqNo = selfLocSeqNo;
+    else
+        selfLocSeqNo = std::max(selfLocSeqNo, tAnchorFirstSeqNo + tAnchorTxCounter);
     EV_INFO << "Selection Timer expired; Transmitting Message";
-    sendAvaPacket(selfLocSeqNo, nodeId, 0xFF, SELF_LOC, vAnchorTxCounter);
+    sendAvaPacket(selfLocSeqNo, nodeId, 0xFF, SELF_LOC, tAnchorTxCounter);
 
-    if (vAnchorTxCounter >= (numVAnchorSlots-1)){ // Stop if we have send to often
+    if (tAnchorTxCounter >= (numTAnchorSlots-1)){ // Stop if we have send to often
         EV_INFO << "Transmitted sufficiently often!" << endl;
-        vAnchorTxCounter = -1;
+        tAnchorTxCounter = -1;
         return;
     }
 
@@ -540,6 +548,8 @@ void AvaApp::handleTxTimer(){
         case RESPONSE:
             sendAvaPacket(seqNo, nodeId, 0xFF, FINAL, -1, "FINAL");
             break;
+        // TODO(refactor): unreachable (txTimer never holds a FINAL) and falls through to default,
+        // which deletes currentPkt without resetting it
         case FINAL:
             if (pollTimer->isScheduled()){
                 cancelEvent(pollTimer);
@@ -615,10 +625,9 @@ void AvaApp::writeToResultFile(simtime_t simTimestamp, clocktime_t clockTimestam
     const Coord& pos = mobility->getCurrentPosition();
     const Coord& vel = mobility->getCurrentVelocity();
 
-    double sigma = 300e-12;
-    double noise = normal(0, sigma, 1);
+    double noise = normal(0, timestampNoise, 1);
     clocktime_t noisyTimestamp = clockTimestamp + clocktime_t(noise);
-    EV_INFO << "Sigma: " << sigma << "; Noise: " << noise << endl;
+    EV_INFO << "Sigma: " << timestampNoise << "; Noise: " << noise << endl;
 
     EV_INFO << "Writing To File @ clockTime: " << clockTimestamp << "; noisyTime: " << noisyTimestamp << "; simTime: " << simTimestamp << endl;
 
@@ -672,16 +681,16 @@ int AvaApp::selectNode(int seqNo){
     // Get initial node selection
     uint64_t x = easyHash(hashSeed + seqNo);
 
-    // First numAnchor + 1 ideas are reserved for anchors (or at least those should be the anchors) and hence cannot be used as nodeId/vAnchor candidate
+    // First numAnchor + 1 ideas are reserved for anchors (or at least those should be the anchors) and hence cannot be used as nodeId/tAnchor candidate
     int idOffset = numAnchors + 1;
 
-    int numVAnchorCandidates = numNodes;
+    int numTAnchorCandidates = numNodes;
 
-    EV_INFO << "Number of v-Anchor Candidates: " << numVAnchorCandidates << endl;
+    EV_INFO << "Number of t-Anchor Candidates: " << numTAnchorCandidates << endl;
 
-    int selectedNode = static_cast<int>(x % numVAnchorCandidates) + idOffset;
+    int selectedNode = static_cast<int>(x % numTAnchorCandidates) + idOffset;
     int counter = 1;
-    int THRESHOLD = numNodes*numVAnchorSlots; // Arbitrarily chosen...
+    int THRESHOLD = numNodes*numTAnchorSlots; // Arbitrarily chosen...
     // Reselect Node if necessary
     while((std::find(selectedNodesPerSlotBuffer.begin(), selectedNodesPerSlotBuffer.end(),selectedNode) != selectedNodesPerSlotBuffer.end())
             && (counter < THRESHOLD)){
@@ -689,7 +698,7 @@ int AvaApp::selectNode(int seqNo){
         EV_INFO << "Selected node already in buffer! : " << selectedNode << lastSelectedNode << " Fixing it! " << endl;
         counter++;
         x = easyHash(hashSeed*counter+seqNo);
-        selectedNode = static_cast<int>(x % numVAnchorCandidates) + idOffset;
+        selectedNode = static_cast<int>(x % numTAnchorCandidates) + idOffset;
     }
 
     if (counter == THRESHOLD){
@@ -745,11 +754,20 @@ void AvaApp::initializeParameters(){
     startTime_c = par("startTime");
     stopTime = par("stopTime");
     stopTime_c = par("stopTime");
-    t_tx_msg = par("t_tx_msg");
-    t_tx_msg_c = par("t_tx_msg");
     packetLength = B(par("packetLength"));
     if (packetLength < B(5))
         throw cRuntimeError("packetLength must be at least 5 B for the AvaMsg header");
+    // Frame duration in the slot: computed from the transmitter unless t_tx_msg is set
+    simtime_t frameDuration = computeFrameDuration();
+    if (par("t_tx_msg").doubleValue() < 0)
+        t_tx_msg = frameDuration;
+    else
+        t_tx_msg = par("t_tx_msg");
+    // A shorter slot lets consecutive messages overlap (1 ns tolerance for rounded values)
+    if (t_tx_msg < frameDuration - SimTime(1, SIMTIME_NS))
+        throw cRuntimeError("t_tx_msg (%s s) is shorter than the frame duration of wlan[0] (%s s)",
+                t_tx_msg.str().c_str(), frameDuration.str().c_str());
+    t_tx_msg_c = SIMTIME_AS_CLOCKTIME(t_tx_msg);
     aTurnaroundTime = par("aTurnaroundTime");
     aTurnaroundTime_c = par("aTurnaroundTime");
     recordInCsv = par("recordInCsv");
@@ -758,9 +776,12 @@ void AvaApp::initializeParameters(){
     useClockTime = par("useClockTime");
     numAnchors = par("numAnchors");
     numNodes = par("numNodes");
-    numVAnchorSlots = par("numVAnchorSlots");
+    numTAnchorSlots = par("numTAnchorSlots");
+    checkSufficientAnchors = par("checkSufficientAnchors");
     hashSeed = par("hashSeed");
-    selectedNodesPerSlotBuffer = std::vector<int>(numVAnchorSlots, -1);
+    timestampNoise = par("timestampNoise");
+    assumedMaxDistance = par("assumedMaxDistance");
+    selectedNodesPerSlotBuffer = std::vector<int>(numTAnchorSlots, -1);
 }
 
 int AvaApp::parseMethodString(const char *methodStr){
@@ -798,7 +819,23 @@ void AvaApp::initializeTimers(){
     selectedNodeTxTimer_c = new ClockEvent("selectedNodeTxTimer_c");
 }
 
+simtime_t AvaApp::computeFrameDuration(){
+    // As ApskScalarTransmitter::createTransmission: preamble, then header and data at the bitrate
+    cModule *wlan = getParentModule()->getSubmodule("wlan", 0);
+    cModule *transmitter = wlan ? wlan->getModuleByPath(".radio.transmitter") : nullptr;
+    if (transmitter == nullptr)
+        throw cRuntimeError("AvaApp: no wlan[0].radio.transmitter to compute the frame duration from");
+    simtime_t preambleDuration = transmitter->par("preambleDuration");
+    b headerLength = b(transmitter->par("headerLength"));
+    bps bitrate = bps(transmitter->par("bitrate"));
+    simtime_t headerDuration = headerLength.get() / bitrate.get();
+    simtime_t dataDuration = b(packetLength).get() / bitrate.get();
+    return preambleDuration + headerDuration + dataDuration;
+}
+
 void AvaApp::calculateDerivedParameters(){
+    t_max_prop = assumedMaxDistance / c;
+    t_max_prop_c = assumedMaxDistance / c;
     // Slot: maximum propagation time + transmission duration + turnaround time (no guard time)
     slotDuration = t_max_prop + t_tx_msg + aTurnaroundTime;
     slotDuration_c = t_max_prop_c + t_tx_msg_c + aTurnaroundTime_c;
@@ -873,6 +910,14 @@ void AvaApp::scheduleTimersAfterSlots(cMessage *timer, ClockEvent *clockTimer, i
     simtime_t delay = numSlots * slotDuration + scheduleOffset;
     clocktime_t delay_c = numSlots * slotDuration_c + scheduleOffset_c;
     scheduleTimers(timer, clockTimer, delay, delay_c);
+}
+
+// Schedules the timers numSlots slots after the start of the slot in which the handled packet was received
+void AvaApp::scheduleTimersAfterRxSlotStart(cMessage *timer, ClockEvent *clockTimer, int numSlots, int interfaceIdx){
+    // Negative offset: start of the received slot as seen by this device (receive timestamp)
+    simtime_t offsetToSlotStart = rxTimestamps[interfaceIdx] - simTime();
+    clocktime_t offsetToSlotStart_c = rxTimestamps_c[interfaceIdx] - getClockTime();
+    scheduleTimersAfterSlots(timer, clockTimer, numSlots, offsetToSlotStart, offsetToSlotStart_c);
 }
 
 

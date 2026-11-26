@@ -12,6 +12,7 @@
 #   INET_DIR=<path>      INET 4.5.4 installation (default: ../inet-4.5.4, i.e. next to this project)
 #   OMNETPP_ROOT=<path>  OMNeT++ 6.2.0 installation (not needed if its setenv was sourced)
 #   JOBS=<n>             Number of parallel runs (default: 8)
+#   REPEAT=<n>           Number of repetitions (overrides repeat in omnetpp.ini)
 #   RUNS=<filter>        Only some runs: run numbers (RUNS=0..3) or a filter (RUNS='$repetition==0')
 
 INET_DIR ?= ../inet-4.5.4
@@ -24,7 +25,7 @@ ifdef OMNETPP_ROOT
 export PATH := $(OMNETPP_ROOT)/bin:$(PATH)
 endif
 
-OPP_RUN := opp_run -l ../src/localization -l $(INET)/src/INET -n .:../src:$(INET)/src -u Cmdenv
+OPP_RUN := opp_run -l ../src/localization -l $(INET)/src/INET -n .:../src:$(INET)/src -u Cmdenv $(if $(REPEAT),--repeat=$(REPEAT))
 
 .PHONY: all makefiles clean run run-all list check-env
 

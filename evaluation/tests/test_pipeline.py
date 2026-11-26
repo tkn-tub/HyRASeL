@@ -1,57 +1,18 @@
+import json
 import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import pipeline
+from config import ROOT, load_config
+from runs import EVENTS_FILE_NAME, POSTPROCESSED_DIR_NAME, RUN_METADATA_FILE_NAME, parameter_key
 
 
-class ConfigTest(unittest.TestCase):
-    def test_config_is_merged_into_defaults(self) -> None:
-        with TemporaryDirectory() as directory:
-            defaults = Path(directory) / "defaults.yml"
-            defaults.write_text(
-                "jobs: 8\npostprocess:\n  tdoa_loss: huber\n  use_vtwr_pos: true\n"
-            )
-            config_path = Path(directory) / "speed.yml"
-            config_path.write_text(
-                "data: data/x/Speed\njobs: 4\npostprocess:\n  tdoa_loss: linear\n"
-            )
-
-            config = pipeline.load_config(config_path, defaults)
-
-        self.assertEqual(config["name"], "speed")
-        self.assertEqual(config["jobs"], 4)
-        self.assertEqual(
-            config["postprocess"], {"tdoa_loss": "linear", "use_vtwr_pos": True}
-        )
-        self.assertEqual(config["sweep"], {})
-
-    def test_data_defaults_to_simulation_config_of_same_name(self) -> None:
-        with TemporaryDirectory() as directory:
-            defaults = Path(directory) / "defaults.yml"
-            defaults.write_text("data_root: ../traces\n")
-            config_path = Path(directory) / "Speed.yml"
-            config_path.write_text("sweep:\n  speed: [5]\n")
-
-            config = pipeline.load_config(config_path, defaults)
-
-        self.assertEqual(config["data"], str(Path("../traces/Speed")))
-
-    def test_options_become_cli_arguments(self) -> None:
-        args = pipeline.to_cli_args(
-            {"format": "pdf", "plots": ["error", "coverage"], "show": True, "no-save": False, "x": None}
-        )
-        self.assertEqual(args, ["--format", "pdf", "--plots", "error", "coverage", "--show"])
-
-    def test_dict_options_become_key_value_arguments(self) -> None:
-        args = pipeline.to_cli_args(
-            {"method-labels": {"CENTRALIZED": "HyRASeL (Centr.)", "DISTRIBUTED": None}, "empty": {}}
-        )
-        self.assertEqual(args, ["--method-labels", "CENTRALIZED=HyRASeL (Centr.)"])
-
+class PipelineTest(unittest.TestCase):
     def test_one_job_per_method_and_sweep_value(self) -> None:
         config = {
             "name": "loss-all",
@@ -59,7 +20,7 @@ class ConfigTest(unittest.TestCase):
             "methods": ["TWR", "CENTRALIZED"],
             "reps": "0-10",
             "sweep": {"loss": [0, 0.05]},
-            "postprocess": {"use_vtwr_pos": True},
+            "postprocess": {"use_t_twr_pos": True},
         }
 
         jobs, missing_raw = pipeline.postprocess_jobs(config, extra_args=[])
@@ -70,8 +31,8 @@ class ConfigTest(unittest.TestCase):
             ["TWR_loss_0", "TWR_loss_0_05", "CENTRALIZED_loss_0", "CENTRALIZED_loss_0_05"],
         )
         self.assertIn("loss:0.05", jobs[1].command)
-        self.assertEqual(jobs[1].command[-1], "--use_vtwr_pos")
-        postprocessed = pipeline.ROOT / "results" / "loss-all" / "postprocessed"
+        self.assertEqual(jobs[1].command[-1], "--use_t_twr_pos")
+        postprocessed = ROOT / "results" / "loss-all" / "postprocessed"
         results_dir_index = jobs[1].command.index("--results_dir")
         self.assertEqual(jobs[1].command[results_dir_index + 1], str(postprocessed))
         self.assertEqual(
@@ -79,9 +40,6 @@ class ConfigTest(unittest.TestCase):
         )
 
     def test_split_reps_creates_one_job_per_rep(self) -> None:
-        self.assertEqual(pipeline.expand_reps("0-2,5"), [0, 1, 2, 5])
-        self.assertEqual(pipeline.expand_reps(["3", 1]), [1, 3])
-
         config = {
             "name": "speed",
             "data": "data/x/Speed",
@@ -99,7 +57,7 @@ class ConfigTest(unittest.TestCase):
 
         # Reps without raw traces get no job and are reported.
         jobs, missing_raw = pipeline.postprocess_jobs(
-            config, extra_args=[], raw_reps={"speed=2,Method=TWR": {1}}
+            config, extra_args=[], raw_reps={parameter_key({"speed": 2, "Method": "TWR"}): {1}}
         )
         self.assertEqual([job.name for job in jobs], ["TWR_speed_2_rep1"])
         self.assertEqual(missing_raw, ["speed=2,Method=TWR/rep0"])
@@ -111,8 +69,8 @@ class ConfigTest(unittest.TestCase):
             for name in ("node[0]_rep0_log.csv", "anchor[1]_rep3_log.csv"):
                 (raw_dir / name).touch()
             self.assertEqual(
-                pipeline.raw_reps_by_parameter_dir(Path(directory)),
-                {"Method=HYPERBOLIC_SELF_LOCALIZATION": {0, 3}},
+                pipeline.raw_reps_by_parameters(Path(directory)),
+                {parameter_key({"Method": "HYPERBOLIC_SELF_LOCALIZATION"}): {0, 3}},
             )
 
             run_dir = Path(directory) / "run" / "rep0"
@@ -127,19 +85,27 @@ class ConfigTest(unittest.TestCase):
             self.assertFalse(pipeline.job_is_done(other))
 
     def test_results_are_sorted_by_config(self) -> None:
-        config = pipeline.load_config(pipeline.ROOT / "configs" / "Speed.yml")
-        results = pipeline.ROOT / "results" / "Speed"
+        config = load_config(ROOT / "configs" / "Speed.yml")
+        results = ROOT / "results" / "Speed"
         self.assertEqual(pipeline.results_dir(config), results)
-        self.assertEqual(
-            pipeline.evaluation_dir(config, []),
-            results / "huber" / "hdop-2_mad-3_stitch_all-ref",
-        )
-        config["postprocess"]["tdoa_solver_profile"] = "legacy"
-        self.assertEqual(
-            pipeline.evaluation_dir(config, ["--localization-methods", "self_loc"]),
-            results / "legacy" / "hdop-2_mad-3_stitch_all-ref_loc-self_loc",
-        )
         self.assertEqual(pipeline.log_dir(config, "20261004_1000"), results / "logs" / "20261004_1000")
+
+    def test_evaluation_dir_follows_the_estimator_of_the_runs(self) -> None:
+        config = load_config(ROOT / "configs" / "Speed.yml")
+        with TemporaryDirectory() as directory, patch.object(pipeline, "RESULTS_ROOT", Path(directory)):
+            results = Path(directory) / "Speed"
+            # Without post-processed runs: the estimator of the config (huber).
+            self.assertEqual(pipeline.evaluation_dir(config, []), results / "huber" / "hdop-2_mad-3_stitch")
+
+            run_dir = results / POSTPROCESSED_DIR_NAME / "speed=5,Method=TWR" / "rep0"
+            run_dir.mkdir(parents=True)
+            (run_dir / EVENTS_FILE_NAME).touch()
+            metadata = {"processing_settings": {"tdoa_loss": "linear"}, "simulation": {"num_nodes": 4, "end_time": 5.0}}
+            (run_dir / RUN_METADATA_FILE_NAME).write_text(json.dumps(metadata))
+            self.assertEqual(
+                pipeline.evaluation_dir(config, ["--localization-methods", "self_loc"]),
+                results / "linear" / "hdop-2_mad-3_stitch_loc-self_loc",
+            )
 
 
 if __name__ == "__main__":

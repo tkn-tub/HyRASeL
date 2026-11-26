@@ -44,14 +44,20 @@ simple AvaApp like IApp
 		double startTime @unit(s) = default(0s); // application start time (start of the first packet)
         double stopTime @unit(s) = default(-1s);  // time of finishing sending, -1s means forever
         double txInterval @unit(s) = default(1s);
-        double t_tx_msg @unit(s) = default(1762129ns); // 4.436363637ms => 4436363.637ns (4000us Preamble); 1762129ns; 1336363ns for 1100us preamble
+        // Frame duration in the slot; -1s: computed from the transmitter of wlan[0] (preamble +
+        // (header + packetLength) / bitrate). An explicit value must not be shorter.
+        double t_tx_msg @unit(s) = default(-1s);
+        // Distance assumed as the largest between transmitter and receiver: every slot reserves
+        // its propagation time. A dimensioning value for the slot, not the radio range.
+        double assumedMaxDistance @unit(m) = default(300m);
         int packetLength @unit(B) = default(5B); // Total PSDU payload length, including the 5-byte AvaMsg header
         bool recordInCsv = default(true);
         bool useClockTime = default(false);
         bool useRescheduling = default(false);
         int numAnchors = default(1);
         int numNodes = default(1);
-        int numVAnchorSlots = default(2);
+        int numTAnchorSlots = default(2);
+        bool checkSufficientAnchors = default(method == "DISTRIBUTED"); // CENTRALIZED, DISTRIBUTED: a node sends as t-anchor only if it overheard four anchors of the sequence
 		
         string method @enum("TWR", "DISTRIBUTED", "CENTRALIZED", "HYPERBOLIC_SELF_LOCALIZATION") = default("CENTRALIZED");
         int hashSeed = default(42);

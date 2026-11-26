@@ -1,3 +1,12 @@
 # Default scenario without sweep parameter (all methods in one setting).
 plots:
-  plots: [error_ecdf, coverage_time, availability_cdf]
+  figures:
+    error_ecdf:
+      type: ecdf
+      metric: error
+    coverage_time:
+      type: timeseries
+      metric: coverage
+    availability_ecdf:
+      type: ecdf
+      metric: availability
