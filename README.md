@@ -124,8 +124,7 @@ The simulation can also be imported into the OMNeT++ IDE (see [simulation/README
 ## Use of AI Tools
 
 Parts of the code and the documentation were written or revised with the
-assistance of AI models (OpenAI ChatGPT, Anthropic Claude). All of it was
-reviewed by the authors.
+assistance of AI models (OpenAI ChatGPT, Anthropic Claude). Results were validated by the authors.
 
 ## Contact
 
