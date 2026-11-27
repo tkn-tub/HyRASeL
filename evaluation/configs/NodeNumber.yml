@@ -2,4 +2,7 @@
 sweep:
   numNodes: [4, 9, 16, 25, 36, 49]
 plots:
-  plots: [coverage]
+  figures:
+    coverage:
+      type: line
+      metric: mean_coverage

@@ -7,29 +7,28 @@ resulting options; usually called through the Makefile (see README.md).
 from __future__ import annotations
 
 import argparse
-import itertools
+import json
 import os
 import shlex
 import subprocess
 import sys
-import re
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple
 
-import yaml
-
 import extract_statistics
+from config import ROOT, load_config, to_cli_args
+from runs import (
+    EVENTS_FILE_NAME, POSTPROCESSED_DIR_NAME, RUN_METADATA_FILE_NAME, parameter_combinations, parameter_dir_name,
+    parameter_key, parse_reps, raw_dirs, run_path, trace_files,
+)
 
-ROOT = Path(__file__).resolve().parent.parent
 RESULTS_ROOT = ROOT / "results"
-POSTPROCESSED_DIR_NAME = "postprocessed"
-DEFAULTS_PATH = ROOT / "configs" / "defaults.yml"
 # Relative to ROOT; the jobs run with ROOT as working directory.
 POSTPROCESS_SCRIPT = "src/post_processing.py"
 EXTRACT_SCRIPT = "src/extract_statistics.py"
-PLOT_SCRIPT = "src/plot_parameter_sweeps.py"
+PLOT_SCRIPT = "src/plot.py"
 
 STEPS = {
     "postprocess": ("postprocess",),
@@ -46,65 +45,8 @@ MAX_LISTED = 5
 
 
 # -----------------------------------------------------------------------------
-# Config handling
+# Runs and directories of a config
 # -----------------------------------------------------------------------------
-
-def deep_merge(base: dict, override: dict) -> dict:
-    """Merge override into base; nested dicts are merged, everything else replaced."""
-    merged = dict(base)
-    for key, value in override.items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = deep_merge(merged[key], value)
-        else:
-            merged[key] = value
-    return merged
-
-
-def load_config(config_path: Path, defaults_path: Path = DEFAULTS_PATH) -> dict:
-    """Load a config merged into the defaults; its name is the file name."""
-    defaults = yaml.safe_load(defaults_path.read_text()) or {}
-    config = yaml.safe_load(config_path.read_text()) or {}
-    merged = deep_merge(defaults, config)
-    merged["name"] = config_path.stem
-    # Raw traces of the simulation config with the same name
-    if "data" not in merged:
-        merged["data"] = str(Path(merged["data_root"]) / merged["name"])
-    for section in ("postprocess", "extract", "plots"):
-        merged[section] = merged.get(section) or {}
-    merged["sweep"] = merged.get("sweep") or {}
-    return merged
-
-
-def to_cli_args(options: dict) -> list[str]:
-    """Translate a config section into command-line arguments."""
-    args = []
-    for key, value in options.items():
-        if value is None or value is False:
-            continue
-        if value is True:
-            args.append(f"--{key}")
-        elif isinstance(value, dict):
-            entries = [f"{name}={entry}" for name, entry in value.items() if entry is not None]
-            if entries:
-                args.extend([f"--{key}", *entries])
-        elif isinstance(value, list):
-            args.extend([f"--{key}", *map(str, value)])
-        else:
-            args.extend([f"--{key}", str(value)])
-    return args
-
-
-def sweep_combinations(sweep: dict) -> list[list[str]]:
-    """All sweep-value combinations as --sweep_parameters entries, e.g. [['speed:2'], ...]."""
-    if not sweep:
-        return [[]]
-    names = list(sweep)
-    value_lists = [values if isinstance(values, list) else [values] for values in sweep.values()]
-    return [
-        [f"{name}:{value}" for name, value in zip(names, values)]
-        for values in itertools.product(*value_lists)
-    ]
-
 
 def results_dir(config: dict) -> Path:
     """Results directory of a config: results/<config name>."""
@@ -117,25 +59,24 @@ def log_dir(config: dict, run_id: str) -> Path:
 
 
 def evaluation_dir(config: dict, extract_args: list[str]) -> Path:
-    """Statistics and figures: <results>/<estimator>/<filter_profile>, as written by the extraction."""
-    return results_dir(config) / extract_statistics.evaluation_subdir(
-        extract_command(config, extract_args)[2:], config["postprocess"]
-    )
+    """Statistics and figures: <results>/<estimator>/<filter_profile>, as written by the extraction.
+
+    The estimator is the tdoa_loss of the post-processed runs, as in the
+    extraction; without runs (dry run before the post-processing), the one of
+    the config.
+    """
+    if existing_run_dirs(config):
+        estimator = extract_statistics.tdoa_estimator(extract_statistics.find_runs(results_dir(config)))
+    else:
+        estimator = config["postprocess"]["tdoa_loss"]
+    # [2:] drops interpreter and script, leaving the options of the extraction.
+    profile = extract_statistics.filter_profile(extract_command(config, extract_args)[2:])
+    return results_dir(config) / estimator / profile
 
 
 # -----------------------------------------------------------------------------
 # Commands
 # -----------------------------------------------------------------------------
-
-def expand_reps(reps: str | int | list) -> list[int]:
-    """Expand repetition specs like "0-10", "3,5,8-15" or [1, "4-6"] to single reps."""
-    expanded = []
-    for spec in reps if isinstance(reps, list) else [reps]:
-        for part in str(spec).split(","):
-            start, _, end = part.strip().partition("-")
-            expanded.extend(range(int(start), int(end or start) + 1))
-    return sorted(set(expanded))
-
 
 class Job(NamedTuple):
     """One post-processing job and the run directories it writes."""
@@ -144,64 +85,49 @@ class Job(NamedTuple):
     run_dirs: list[Path]
 
 
-def parameter_dir_name(method: str, combination: list[str]) -> str:
-    """Run directory name as written by the post-processing, e.g. speed=2,Method=TWR."""
-    return ",".join(
-        [entry.replace(":", "=", 1) for entry in combination] + [f"Method={method}"]
-    )
-
-
-def raw_reps_by_parameter_dir(data_dir: Path) -> dict[str, set[int]]:
-    """Reps with raw traces per parameter directory, e.g. {'speed=2,Method=TWR': {0, 1}}.
-
-    Raw directories carry '#' escapes and a trailing '-'
-    (Method=HYPERBOLIC#_SELF#_LOCALIZATION-).
-    """
-    reps = {}
-    for raw_dir in data_dir.iterdir():
-        if raw_dir.is_dir():
-            reps[raw_dir.name.replace("#", "").rstrip("-")] = {
-                int(match.group(1))
-                for trace in raw_dir.glob("*_rep*_log.csv")
-                if (match := re.search(r"_rep(\d+)_log\.csv$", trace.name))
-            }
-    return reps
+def raw_reps_by_parameters(data_dir: Path) -> dict[frozenset, set[int]]:
+    """Reps with raw traces by the runs.parameter_key of every raw directory."""
+    return {key: set(trace_files(raw_dir)) for key, raw_dir in raw_dirs(data_dir).items()}
 
 
 def postprocess_jobs(
     config: dict,
     extra_args: list[str],
-    raw_reps: dict[str, set[int]] | None = None,
+    raw_reps: dict[frozenset, set[int]] | None = None,
 ) -> tuple[list[Job], list[str]]:
     """One job per method, sweep combination and (with split_reps) rep.
 
-    raw_reps (see raw_reps_by_parameter_dir) restricts the jobs to reps that
+    raw_reps (see raw_reps_by_parameters) restricts the jobs to reps that
     have raw data.  Returns the jobs and the runs without raw data.
     """
-    reps = config["reps"] if isinstance(config["reps"], list) else [config["reps"]]
+    # Rep specs as in the config, e.g. ["0-19"] or [1, "4-6"].
+    rep_specs = config["reps"] if isinstance(config["reps"], list) else [config["reps"]]
+    config_reps = parse_reps(rep_specs)
     split_reps = bool(config.get("split_reps"))
     output_dir = results_dir(config) / POSTPROCESSED_DIR_NAME
     jobs, missing_raw = [], []
     for method in config["methods"]:
-        for combination in sweep_combinations(config["sweep"]):
-            parameter_dir = parameter_dir_name(method, combination)
-            config_reps = expand_reps(reps)
+        for combination in parameter_combinations(config["sweep"]):
+            parameters = {**combination, "Method": method}
+            parameter_dir = parameter_dir_name(parameters)
+            # --sweep_parameters entries, e.g. speed:2
+            sweep_args = [f"{name}:{value}" for name, value in combination.items()]
+            reps = config_reps
             if raw_reps is not None:
-                available = raw_reps.get(parameter_dir, set())
+                available = raw_reps.get(parameter_key(parameters), set())
                 missing_raw += [f"{parameter_dir}/rep{rep}" for rep in config_reps if rep not in available]
+                # Without split_reps, the one job keeps all reps; post_processing.py skips runs without traces.
                 if split_reps:
-                    config_reps = [rep for rep in config_reps if rep in available]
+                    reps = [rep for rep in config_reps if rep in available]
             # With split_reps every rep is its own job; otherwise one job runs all reps.
-            rep_groups = (
-                [[str(rep)] for rep in config_reps]
-                if split_reps
-                else [list(map(str, reps))]
-            )
-            for rep_group in rep_groups:
-                rep_suffix = [f"rep{rep_group[0]}"] if split_reps else []
+            reps_per_job = [[rep] for rep in reps] if split_reps else [reps]
+            for job_reps in reps_per_job:
+                # The single job passes the specs unchanged (e.g. "0-19"); --rep_limit expands them.
+                rep_limit = [str(job_reps[0])] if split_reps else list(map(str, rep_specs))
+                rep_suffix = [f"rep{job_reps[0]}"] if split_reps else []
                 # '.' and ':' have a special meaning in tmux targets.
                 window_name = (
-                    "_".join([method, *combination, *rep_suffix])
+                    "_".join([method, *sweep_args, *rep_suffix])
                     .replace(".", "_")
                     .replace(":", "_")
                 )
@@ -209,16 +135,14 @@ def postprocess_jobs(
                     sys.executable, POSTPROCESS_SCRIPT,
                     "--method", method,
                     "--experiment_path", str(config["data"]),
-                    "--rep_limit", *rep_group,
-                    *(["--sweep_parameters", *combination] if combination else []),
+                    "--rep_limit", *rep_limit,
+                    *(["--sweep_parameters", *sweep_args] if sweep_args else []),
                     "--results_dir", str(output_dir),
                     *to_cli_args(config["postprocess"]),
                     *extra_args,
                 ]
-                run_dirs = [
-                    output_dir / parameter_dir / f"rep{rep}"
-                    for rep in (expand_reps(rep_group) if split_reps else config_reps)
-                ]
+                # Run directories the job writes; --resume (job_is_done) and the extract step check them.
+                run_dirs = [run_path(output_dir, parameters, rep) for rep in job_reps]
                 jobs.append(Job(window_name, command, run_dirs))
     return jobs, missing_raw
 
@@ -226,10 +150,10 @@ def postprocess_jobs(
 def job_is_done(job: Job) -> bool:
     """True if all runs of the job exist and were written by exactly this command."""
     for run_dir in job.run_dirs:
-        metadata_path = run_dir / "run_metadata.json"
-        if not (run_dir / "localization_events.csv").exists() or not metadata_path.exists():
+        metadata_path = run_dir / RUN_METADATA_FILE_NAME
+        if not (run_dir / EVENTS_FILE_NAME).exists() or not metadata_path.exists():
             return False
-        recorded_command = yaml.safe_load(metadata_path.read_text()).get("command")
+        recorded_command = json.loads(metadata_path.read_text()).get("command")
         # The post-processing records sys.argv, i.e. the command without the interpreter.
         if recorded_command != job.command[1:]:
             return False
@@ -240,7 +164,7 @@ def existing_run_dirs(config: dict) -> set[Path]:
     """Post-processed runs in <results>/postprocessed/."""
     return {
         path.parent
-        for path in (results_dir(config) / POSTPROCESSED_DIR_NAME).glob("*/rep*/localization_events.csv")
+        for path in (results_dir(config) / POSTPROCESSED_DIR_NAME).glob(f"*/rep*/{EVENTS_FILE_NAME}")
     }
 
 
@@ -253,6 +177,7 @@ def warn(message: str, items: list) -> None:
 
 
 def extract_command(config: dict, extra_args: list[str]) -> list[str]:
+    """Command of the extraction step: options of the config section extract, then extra_args."""
     return [
         sys.executable, EXTRACT_SCRIPT,
         "--config-path", str(results_dir(config)),
@@ -262,15 +187,17 @@ def extract_command(config: dict, extra_args: list[str]) -> list[str]:
 
 
 def plot_command(config: dict, extra_args: list[str], extract_args: list[str]) -> list[str]:
+    """Command of the plot step for the evaluation directory of the extraction with extract_args."""
     return [
         sys.executable, PLOT_SCRIPT,
         str(evaluation_dir(config, extract_args)),
-        *to_cli_args(config["plots"]),
+        "--config", config["path"],
         *extra_args,
     ]
 
 
 def format_command(command: list[str]) -> str:
+    """Command as a shell-quoted string."""
     return shlex.join(command)
 
 
@@ -279,6 +206,7 @@ def format_command(command: list[str]) -> str:
 # -----------------------------------------------------------------------------
 
 def run_command(command: list[str]) -> None:
+    """Print and run a command in the foreground; raises if it fails."""
     print(f"\n$ {format_command(command)}", flush=True)
     subprocess.run(command, cwd=ROOT, check=True)
 
@@ -292,12 +220,8 @@ def tmux_window_ids() -> set[str]:
     return set(output.split())
 
 
-def run_jobs_in_tmux_windows(
-    jobs: list[tuple[str, list[str]]],
-    max_parallel_jobs: int,
-    job_log_dir: Path,
-) -> None:
-    """Run every job (name, command, ...) in its own window of the current tmux session.
+def run_jobs_in_tmux_windows(jobs: list[Job], max_parallel_jobs: int, job_log_dir: Path) -> None:
+    """Run every job in its own window of the current tmux session, named after the job.
 
     Each job writes its output to <job_log_dir>/<window>.log and its exit code to
     <job_log_dir>/<window>.exit.  A job whose window disappears without an exit
@@ -314,16 +238,20 @@ def run_jobs_in_tmux_windows(
     num_finished = 0
 
     while pending or running:
+        # Start jobs until max_parallel_jobs are running.
         while pending and len(running) < max_parallel_jobs:
-            window_name, command = pending.pop(0)[:2]
+            job = pending.pop(0)
+            window_name, command = job.name, job.command
             log_file = job_log_dir / f"{window_name}.log"
             exit_file = job_log_dir / f"{window_name}.exit"
             print(f"start  {window_name}: {format_command(command)}", flush=True)
+            # tee shows the output in the window and logs it; PIPESTATUS[0] is the exit code of the job, not of tee.
             script = (
                 f"cd {shlex.quote(str(ROOT))} && export PYTHONUNBUFFERED=1 && "
                 f"{format_command(command)} 2>&1 | tee {shlex.quote(str(log_file))}; "
                 f"echo ${{PIPESTATUS[0]}} > {shlex.quote(str(exit_file))}"
             )
+            # -d: in the background; -P -F: print the ID of the new window.
             window_id = subprocess.run(
                 [
                     "tmux", "new-window", "-d", "-P", "-F", "#{window_id}",
@@ -339,6 +267,7 @@ def run_jobs_in_tmux_windows(
         # for a closed one.
         open_windows = tmux_window_ids()
         for window_name, (exit_file, window_id) in list(running.items()):
+            # An exit file that is still being written is empty: the job counts as running.
             exit_text = exit_file.read_text().strip() if exit_file.exists() else ""
             if exit_text:
                 exit_code = int(exit_text)
@@ -347,6 +276,7 @@ def run_jobs_in_tmux_windows(
                 exit_code = None
                 status = "FAILED (window closed without exit code)"
             else:
+                # Still running.
                 continue
             del running[window_name]
             num_finished += 1
@@ -361,48 +291,60 @@ def run_jobs_in_tmux_windows(
         )
 
 
+def run_postprocess(config: dict, args: argparse.Namespace) -> None:
+    """Post-process the runs of a config in parallel tmux windows (or with --dry-run print the commands)."""
+    jobs, missing_raw = postprocess_jobs(
+        config, args.postprocess_args, raw_reps_by_parameters(ROOT / config["data"])
+    )
+    warn("runs of the config have no raw data and are skipped", missing_raw)
+    if args.resume:
+        done = [job for job in jobs if job_is_done(job)]
+        jobs = [job for job in jobs if job not in done]
+        print(f"--resume: {len(done)} job(s) already done, {len(jobs)} to run", flush=True)
+    if args.dry_run:
+        for job in jobs:
+            print(format_command(job.command))
+    else:
+        run_jobs_in_tmux_windows(jobs, int(config["jobs"]), log_dir(config, args.run_id))
+
+
+def report_unexpected_runs(config: dict) -> None:
+    """Warn about post-processed runs outside the config and runs of the config that are not post-processed.
+
+    Runs outside the config are kept and included on purpose (e.g. a config
+    split over several machines); they are only reported.
+    """
+    # All runs of the config, without the check for raw traces.
+    expected = {run_dir for job in postprocess_jobs(config, [])[0] for run_dir in job.run_dirs}
+    existing = existing_run_dirs(config)
+    results = results_dir(config)
+    warn(
+        "post-processed runs are not part of the config but are included",
+        [path.relative_to(results) for path in existing - expected],
+    )
+    warn("runs of the config are not post-processed", [path.relative_to(results) for path in expected - existing])
+
+
 def run_config(config: dict, steps: tuple[str, ...], args: argparse.Namespace) -> None:
+    """Run (or with --dry-run print) the steps for one config."""
     print(f"\n=== {config['name']}: {' -> '.join(steps)} (results: {results_dir(config)})", flush=True)
+    if config["sources"]:
+        print("Plot-only config (sources): postprocess and extract are skipped", flush=True)
+        steps = tuple(step for step in steps if step == "plots")
     for step in steps:
         if step == "postprocess":
-            jobs, missing_raw = postprocess_jobs(
-                config, args.postprocess_args, raw_reps_by_parameter_dir(ROOT / config["data"])
-            )
-            warn("runs of the config have no raw data and are skipped", missing_raw)
-            if args.resume:
-                done = [job for job in jobs if job_is_done(job)]
-                jobs = [job for job in jobs if job not in done]
-                print(f"--resume: {len(done)} job(s) already done, {len(jobs)} to run", flush=True)
-            if args.dry_run:
-                for job in jobs:
-                    print(format_command(job.command))
-            else:
-                run_jobs_in_tmux_windows(jobs, int(config["jobs"]), log_dir(config, args.run_id))
+            run_postprocess(config, args)
+            continue
+        if step == "extract":
+            report_unexpected_runs(config)
+            command = extract_command(config, args.extract_args)
         else:
-            if step == "extract":
-                # Runs outside the config are kept and included on purpose
-                # (e.g. a config split over several machines); only report them.
-                expected = {
-                    run_dir
-                    for job in postprocess_jobs(config, [])[0]
-                    for run_dir in job.run_dirs
-                }
-                existing = existing_run_dirs(config)
-                relative = lambda paths: [path.relative_to(results_dir(config)) for path in paths]
-                warn(
-                    "post-processed runs are not part of the config but are included",
-                    relative(existing - expected),
-                )
-                warn("runs of the config are not post-processed", relative(expected - existing))
-            command = (
-                extract_command(config, args.extract_args)
-                if step == "extract"
-                else plot_command(config, args.plot_args, args.extract_args)
-            )
-            if args.dry_run:
-                print(format_command(command))
-            else:
-                run_command(command)
+            # The plot step needs the extraction options to find the evaluation directory.
+            command = plot_command(config, args.plot_args, args.extract_args)
+        if args.dry_run:
+            print(format_command(command))
+        else:
+            run_command(command)
 
 
 def start_tmux_session(args: argparse.Namespace, configs: list[dict]) -> None:
@@ -426,6 +368,7 @@ def start_tmux_session(args: argparse.Namespace, configs: list[dict]) -> None:
         else ROOT / "logs" / session / args.run_id
     )
     session_log_dir.mkdir(parents=True, exist_ok=True)
+    # The same run ID, so the session writes to the log directory printed below.
     command = [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:], "--run-id", args.run_id]
     # On success the session closes (the output stays in pipeline.log); on
     # failure the pipeline window stays open until Enter is pressed.
@@ -446,6 +389,7 @@ def start_tmux_session(args: argparse.Namespace, configs: list[dict]) -> None:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Command-line arguments."""
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -468,20 +412,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> None:
+    """Load the configs and run the step for each of them, in a new tmux session if needed."""
     args = parse_args(argv)
     configs = []
     for config_path in args.configs:
         if not config_path.is_file():
             raise SystemExit(f"Evaluation config {config_path} does not exist (see README)")
         config = load_config(config_path)
+        # Command-line overrides (make JOBS=..., REPS=..., METHODS=...) replace the config values.
         for key in ("jobs", "reps", "methods"):
             if getattr(args, key) is not None:
                 config[key] = getattr(args, key)
         data_dir = (ROOT / config["data"]).resolve()
-        if "postprocess" in STEPS[args.step] and not data_dir.is_dir():
+        if "postprocess" in STEPS[args.step] and not config["sources"] and not data_dir.is_dir():
             raise SystemExit(f"{config['name']}: no simulation traces in {data_dir}, run the simulation first")
         configs.append(config)
 
+    # Outside tmux, detached steps start this script again in a new tmux session and return.
     in_tmux = bool(os.environ.get("TMUX"))
     if args.step in DETACHED_STEPS and not (args.foreground or args.dry_run or in_tmux):
         start_tmux_session(args, configs)

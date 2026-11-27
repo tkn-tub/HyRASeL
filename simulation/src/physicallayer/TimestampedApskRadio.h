@@ -38,6 +38,12 @@ class INET_API TimestampedApskRadio : public ApskRadio
      */
     virtual bool isDroppedByInjectedLoss(const IReception *reception);
 
+    /**
+     * Returns an optional channel-specific delay added after INET propagation.
+     * The generic APSK model has no extra delay.
+     */
+    virtual omnetpp::simtime_t computeExcessDelay(const IReception *reception) const;
+
     /** Attaches timing only to a frame that passed the PHY reception decision. */
     virtual void attachReceptionTiming(Packet *packet, const IReception *reception,
                                        bool successful) const;

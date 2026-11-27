@@ -31,6 +31,7 @@
 using namespace inet;
 namespace localization{
 
+// TODO(refactor): one app per localization method with a common base class instead of the method switches
 class INET_API AvaApp : public ClockUserModuleMixin<ApplicationBase> {
 
 private:
@@ -68,24 +69,26 @@ protected:
     bool useClockTime = false;
     bool useRescheduling = false;
     int twrSeqNo = 1;
-    int lastFinalTwrSeqNo = -1; // TWR round (POLL seqNo) for which a FINAL was already scheduled
     int selfLocSeqNo = 0;
-    int maxRange = 300; //m
+    double assumedMaxDistance = 300; // [m] (parameter assumedMaxDistance)
     double c = 3e8;
-    simtime_t t_max_prop = maxRange/c;
-    simtime_t t_tx_msg; // Duration of a transmission (parameter t_tx_msg)
+    simtime_t t_max_prop; // Propagation time reserved in every slot
+    simtime_t t_tx_msg; // Frame duration in the slot (parameter t_tx_msg or computed from the transmitter)
     b packetLength = B(5);
+    double timestampNoise = 0; // Standard deviation of the noise of noisy_timestamp [s]
     simtime_t slotDuration = -1;
 
-    clocktime_t t_max_prop_c = maxRange/c;
+    clocktime_t t_max_prop_c;
     clocktime_t t_tx_msg_c;
     clocktime_t slotDuration_c;
     int numAnchors = -1;
     int numNodes = -1;
-    int numVAnchorSlots = -1;
+    int numTAnchorSlots = -1;
+    bool checkSufficientAnchors = false;
     int totalNumSlots = -1;
     int contendingNode = -1;
-    int vAnchorTxCounter = -1;
+    int tAnchorTxCounter = -1;
+    int tAnchorFirstSeqNo = -1; // seqNo of the first t-anchor slot of the current selection
     int seqNoCounter = -1;
     int prevSeqNo = -1;
     int selectedMethod = -1;
@@ -193,9 +196,11 @@ protected:
 
 
 
+    simtime_t computeFrameDuration();
     void calculateDerivedParameters();
     void scheduleTimers(cMessage *timer, ClockEvent *clockTimer, simtime_t delay, clocktime_t delay_c);
     void scheduleTimersAfterSlots(cMessage *timer, ClockEvent *clockTimer, int numSlots, simtime_t scheduleOffset = 0, clocktime_t scheduleOffset_c = 0);
+    void scheduleTimersAfterRxSlotStart(cMessage *timer, ClockEvent *clockTimer, int numSlots, int interfaceIdx);
     void rescheduleClockTimer(ClockEvent *clockTimer, int numSlots);
     void rescheduleAllClocksIfNeeded(const AvaPacketInfo& info);
     void updateLocalSequenceNumber(const AvaPacketInfo& info);

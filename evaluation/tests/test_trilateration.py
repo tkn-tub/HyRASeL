@@ -8,7 +8,7 @@ from pathlib import Path
 # The modules of the evaluation chain live in src/.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-import post_processing
+import solvers
 
 # Anchor layout of a 3D test scenario (X, Y, Z).
 ANCHORS = np.array([
@@ -34,7 +34,7 @@ class LinearStartTest(unittest.TestCase):
         ])
         distances = np.sqrt(np.array([50.0, 90.0, 70.0, 50.0]))
 
-        start = post_processing._linear_trilateration_start(anchors, distances)
+        start = solvers.linear_trilateration_start(anchors, distances)
 
         np.testing.assert_allclose(start, [3.0, 4.0, 5.0], atol=1e-9)
 
@@ -44,12 +44,12 @@ class LinearStartTest(unittest.TestCase):
         distances = np.linalg.norm(anchors - np.array([250.0, 400.0, 400.0]), axis=1)
 
         self.assertIsNone(
-            post_processing._linear_trilateration_start(anchors, distances)
+            solvers.linear_trilateration_start(anchors, distances)
         )
 
     def test_three_anchors_have_no_linear_start(self) -> None:
         self.assertIsNone(
-            post_processing._linear_trilateration_start(
+            solvers.linear_trilateration_start(
                 ANCHORS[:3], np.array([100.0, 100.0, 100.0])
             )
         )
@@ -69,7 +69,7 @@ class TrilaterationTest(unittest.TestCase):
                 mean_z + rng.uniform(-40, 40),
             ])
 
-            estimate = post_processing._trilaterate_position_from_tof(
+            estimate = solvers.trilaterate(
                 ANCHORS, _tofs(ANCHORS, truth)
             )
 
@@ -87,7 +87,7 @@ class TrilaterationTest(unittest.TestCase):
                 mean_z + rng.uniform(-40, 40),
             ])
 
-            estimate = post_processing._trilaterate_position_from_tof(
+            estimate = solvers.trilaterate(
                 ANCHORS, _tofs(ANCHORS, truth, rng.normal(0, 0.1, 4))
             )
 
@@ -98,7 +98,7 @@ class TrilaterationTest(unittest.TestCase):
         anchors[:, 2] = 400.0
         truth = np.array([250.0, 380.0, 400.0])
 
-        estimate = post_processing._trilaterate_position_from_tof(
+        estimate = solvers.trilaterate(
             anchors, _tofs(anchors, truth)
         )
 

@@ -71,6 +71,12 @@ bool TimestampedApskRadio::isDroppedByInjectedLoss(const IReception *reception)
     return dropped;
 }
 
+omnetpp::simtime_t TimestampedApskRadio::computeExcessDelay(const IReception *) const
+{
+    // Standard INET propagation already provides the complete geometric d/c delay.
+    return SIMTIME_ZERO;
+}
+
 void TimestampedApskRadio::attachReceptionTiming(
     Packet *packet,
     const IReception *reception,
@@ -81,8 +87,13 @@ void TimestampedApskRadio::attachReceptionTiming(
     if (!successful)
         return;
 
+    const omnetpp::simtime_t excessDelay = computeExcessDelay(reception);
+    if (excessDelay < SIMTIME_ZERO)
+        throw cRuntimeError("TimestampedApskRadio: excess delay must be non-negative");
+
     auto timing = packet->addTagIfAbsent<ReceptionTimingInd>();
-    timing->setStartRxTime(reception->getStartTime());
+    timing->setExcessDelay(excessDelay);
+    timing->setStartRxTime(reception->getStartTime() + excessDelay);
 }
 
 void TimestampedApskRadio::endReception(cMessage *timer)

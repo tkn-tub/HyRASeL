@@ -36,6 +36,10 @@ RUN curl -fsSL https://github.com/inet-framework/inet/releases/download/v${INET_
     && make -j"$(nproc)" MODE=release
 ENV INET_DIR=/opt/inet-${INET_VERSION}
 
+# Font of the figures; without it matplotlib falls back to the wider DejaVu Sans
+RUN apt-get update && apt-get install -y --no-install-recommends fonts-liberation \
+    && rm -rf /var/lib/apt/lists/*
+
 # Python packages of the evaluation
 COPY evaluation/requirements.txt /tmp/requirements.txt
 RUN python3 -m venv /opt/venv && /opt/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt

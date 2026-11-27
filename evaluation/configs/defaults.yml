@@ -3,16 +3,20 @@
 # A config only needs the entries that differ from these defaults; nested
 # sections are merged key by key.
 #
-# The sections postprocess / extract / plots are passed 1:1 as command-line
-# arguments to the respective script:
+# The sections postprocess / extract are passed 1:1 as command-line arguments
+# to the respective script:
 #   key: value  -> --key value       key: true   -> --key
 #   key: [a, b] -> --key a b         false/null  -> omitted
-#   key: {a: x, b: y} -> --key a=x b=y
 # Spell keys exactly like the script's option (underscores or dashes).
+# The section plots is read by src/plot.py.
 
 # Raw traces are read from <data_root>/<Config>/ (relative to the evaluation
-# directory); results go to results/<Config>/.
+# directory), or from `data: <path>` of a config; results go to results/<Config>/.
 data_root: ../simulation/simulations/results/traces
+# Plot-only config: `sources: {<Config>: [<METHOD>, ...]}` draws the methods of
+# other configs from their results ({<METHOD>: <name>} renames a method); read
+# with the estimator and filter profile of this config, without own
+# post-processing and extraction.
 
 methods: [TWR, CENTRALIZED, HYPERBOLIC_SELF_LOCALIZATION]
 reps: "0-19"
@@ -23,44 +27,88 @@ jobs: 4
 split_reps: true
 
 postprocess:          # src/post_processing.py
-  use_vtwr_pos: true
+  use_t_twr_pos: true
+  copy_t_twr_pos_to_poll: true  # POLLs without own t-TWR position get the one of their FINAL (for TDoA)
   timestamp_format: noisy_timestamp
-  tdoa_solver_profile: robust
   tdoa_dimension: auto
   tdoa_loss: huber
 
 # Statistics and figures go to results/<Config>/<estimator>/<filter_profile>/:
-# estimator is tdoa_loss (legacy for tdoa_solver_profile: legacy), the filter
-# profile is named after the extract options, e.g. hdop-2_mad-3_stitch_all-ref.
+# estimator is tdoa_loss, the filter profile is named after the extract options,
+# e.g. hdop-2_mad-3_stitch.
 extract:              # src/extract_statistics.py
   coverage-window-size: 0.04   # [s]
   error-dimension: 2d          # 2d: DOP filter on HDOP, 3d: on PDOP
   pdop-max: 2.0
   residual-mad-max: 3.0
   use-anchor-stitching: true
-  localization-methods: [self_loc, v_twr, twr]
+  localization-methods: [self_loc, t_twr, twr]
 
-plots:                # src/plot_parameter_sweeps.py
-  format: pdf
-  # Methods shown in the figures, in legend order. Post-processing and
-  # extraction still run for all `methods` above. <METHOD>.v_twr is the v-TWR
-  # part of a method as its own line (only error_by_technique,
-  # interval_by_technique and error_ecdf). A config replaces this list as a whole.
-  methods: [CENTRALIZED, CENTRALIZED.v_twr, TWR, HYPERBOLIC_SELF_LOCALIZATION]
-  # Width of single line plots as a fraction of the column width, e.g.
-  # width: {coverage: 0.5, availability_q10: 0.5} for two separate figures next
-  # to each other in one column (include with width=0.5\columnwidth).
-  # Default: full column width.
-  # Display names; a config only lists the names it changes. Colors and line
-  # styles belong to the method, not to its name.
-  method-labels:
-    CENTRALIZED: "HyRASeL"
-    CENTRALIZED.v_twr: "v-TWR"
-    DISTRIBUTED: "HyRASeL (Distr.)"
-    DISTRIBUTED.v_twr: "v-TWR (Distr.)"
-    TWR: "TWR (Baseline)"
-    HYPERBOLIC_SELF_LOCALIZATION: "Chiasson et al. (Baseline)"
-  # Moving average of coverage-over-time plots [s]: about 6 coverage windows
-  # and 5 % of the shortest simulation; legend numbers use unsmoothed data.
-  smoothing-window: 0.25
-  ecdf-mode: separate          # combined, separate or both
+plots:                # src/plot.py, see README.md (Figures)
+  # Options of all figures; the options of the plot types (src/plot_types.py)
+  # can be set here as well.
+  defaults:
+    # Methods in legend order. Post-processing and extraction still run for all
+    # `methods` above. <METHOD>.<part> is the part of a method localized with
+    # one technique (self_loc, t_twr, twr), e.g. CENTRALIZED.t_twr; methods
+    # without data in a figure are left out.
+    methods: [CENTRALIZED, CENTRALIZED.t_twr, TWR, HYPERBOLIC_SELF_LOCALIZATION]
+    format: pdf               # pdf, png or svg
+    # Figures are saved with exactly this size, so the font sizes are true
+    # sizes when a figure is included with width=<width>\columnwidth.
+    column_width: 3.5         # [in], IEEE two-column layout
+    width: 1.0                # fraction of column_width
+    height: 1.9               # one axes incl. legend [in]; stacked facets: half per facet
+    font_size: 9              # axis labels, legend, titles [pt]
+    tick_font_size: 8         # tick labels [pt]
+    # Axes; empty: automatic (labels from `labels` below)
+    xlabel:
+    ylabel:
+    xlim:                     # [min, max]
+    ylim:
+    xticks:                   # list of values
+    xlog: false
+    ylog: false
+  # Display names of methods, metrics and sweep parameters. The unit in [...]
+  # of a sweep parameter is shown with its values (facet titles, legend).
+  labels:
+    CENTRALIZED: HyRASeL
+    CENTRALIZED.t_twr: t-TWR
+    DISTRIBUTED: HyRASeL (Distr.)
+    DISTRIBUTED.t_twr: t-TWR (Distr.)
+    TWR: TWR (Baseline)
+    HYPERBOLIC_SELF_LOCALIZATION: Chiasson et al. (Baseline)
+    # Metrics of statistics_run_aggregated.csv (plot type line)
+    mean_error: Localization Error [m]
+    rmse_error: RMSE [m]
+    mean_localization_interval: Inter-Update Interval [s]
+    mean_coverage: Mean Coverage
+    median_availability: Median Node Availability
+    q10_availability: "10 % Quantile of\nNode Availability"
+    q90_availability: "90 % Quantile of\nNode Availability"
+    update_rate: "Updates per Node\nand Second [1/s]"
+    # Samples (plot types ecdf, timeseries)
+    error: Localization Error [m]
+    availability: Node Availability
+    coverage: Coverage Fraction
+    # Sweep parameters
+    numSlots: Number of t-Anchor Slots
+    numNodes: Number of Nodes
+    interAnchorDist: Inter-Anchor Distance [m]
+    speed: Speed [m/s]
+    anchorNodeLoss: Anchor-Node Message Loss Probability
+    nodeNodeLoss: Node-Node Message Loss Probability
+  # Look of every method in all figures: index into the color (tab10), line
+  # style and marker cycles of src/plot_style.py. Methods without an entry get
+  # the next free index.
+  styles:
+    HYPERBOLIC_SELF_LOCALIZATION: 0
+    CENTRALIZED: 1
+    DISTRIBUTED: 2
+    TWR: 4
+  # <METHOD>.<part> keeps the color of its method; line style and marker of the part
+  part_styles:
+    t_twr:
+      linestyle: ":"
+      marker: D
+      markerfacecolor: white

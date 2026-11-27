@@ -1,46 +1,43 @@
-"""v-anchor opportunities of HyRASeL (Centralized and Distributed).
+"""t-anchor opportunities of HyRASeL (Centralized and Distributed).
 
-Reconstructs from the raw traces whether the opportunity for a new v-anchor in
-every anchor sequence was used, missed or had no eligible node.
+Reconstructs from the raw traces and the t-TWR positions of the post-processing
+whether the opportunity for a new t-anchor in every anchor sequence was used,
+missed or had no eligible node.
 """
 
 from __future__ import annotations
 
-import re
-from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-# Methods with a v-anchor selection; all others have no opportunities.
+from runs import SIM, find_run_traces, num_node_traces, read_traces
+
+# Methods with a t-anchor selection; all others have no opportunities.
 SUPPORTED_METHODS = ("CENTRALIZED", "DISTRIBUTED")
 
 # AvaApp::overheardSufficientAnchors(): seqNoCounter >= 4.
 MIN_HEARD_ANCHORS = 4
 
 # Outcomes of a sequence, also the order of the opportunity_<outcome> metrics:
-#   used              a new v-anchor transmitted in the first v-anchor slot
-#                     (Distributed: and its contention succeeded)
+#   used              a new t-anchor transmitted in the first t-anchor slot and got a
+#                     t-TWR position (Distributed: and its contention succeeded)
 #   missed_no_sender  >= 1 eligible node, but nobody transmitted
-#   missed_failed     node(s) transmitted, but no contention succeeded
+#   missed_failed     node(s) transmitted, but no contention succeeded or the new
+#                     t-anchor got no t-TWR position
 #   missed_stale      only nodes with a stale seqNo (of an earlier sequence)
 #                     transmitted
-#   no_eligible_node  no node heard enough anchors
+#   no_eligible_node  no eligible node (see make_opportunity_df)
 OUTCOMES = ("used", "missed_no_sender", "missed_failed", "missed_stale", "no_eligible_node")
-
-# File names of the raw traces, e.g. node[12]_rep3_log.csv.
-TRACE_NAME_PATTERN = re.compile(
-    r"^(anchor|persistentVAnchor|node)\[(\d+)\]_rep(\d+)_log\.csv$",
-    re.IGNORECASE,
-)
 
 # Columns of opportunities.csv (one row per sequence):
 #   seqNo                         anchor sequence number
 #   seq_start_time                [s] start of the sequence (slot 0)
 #   num_nodes                     simulated nodes (denominator of the eligible fraction)
 #   num_eligible_nodes            nodes that heard >= MIN_HEARD_ANCHORS anchors of the sequence
-#   num_first_slot_senders        nodes that sent in the first v-anchor slot (incl. stale)
+#                                 and are not busy as t-anchor of an earlier sequence
+#   num_first_slot_senders        nodes that sent in the first t-anchor slot (incl. stale)
 #   num_stale_first_slot_senders  of these, nodes that sent with a stale seqNo
 #   used                          True if the opportunity was used
 #   outcome                       one of OUTCOMES
@@ -56,106 +53,32 @@ OPPORTUNITY_COLUMNS = [
 ]
 
 
-# -----------------------------------------------------------------------------
-# Loading raw traces
-# -----------------------------------------------------------------------------
-
-@lru_cache(maxsize=None)
-def _raw_dirs_by_parameter_dir(experiment_path: Path) -> dict[str, Path]:
-    """Raw directories by post-processed name (without '#' escapes and trailing '-').
-
-    Example: 'Method=HYPERBOLIC#_SELF#_LOCALIZATION-' -> 'Method=HYPERBOLIC_SELF_LOCALIZATION'.
-    Cached, because the extraction asks once per run for the same experiment.
-    """
-    return {
-        raw_dir.name.replace("#", "").rstrip("-"): raw_dir
-        for raw_dir in experiment_path.iterdir()
-        if raw_dir.is_dir()
-    }
-
-
-def find_raw_traces(experiment_path: Path, parameter_dir_name: str, rep: int) -> list[Path]:
-    """Raw OMNeT++ traces of one run (all anchors and nodes of one repetition).
-
-    parameter_dir_name is the name of the post-processed run directory, e.g.
-    'interAnchorDist=200,Method=CENTRALIZED'.  Returns [] if the experiment,
-    the parameter directory or the repetition does not exist.
-    """
-    if not experiment_path.is_dir():
-        return []
-    raw_dir = _raw_dirs_by_parameter_dir(experiment_path).get(parameter_dir_name)
-    if raw_dir is None:
-        return []
-    # The pattern check keeps rep1 from matching rep10, rep11, ...
-    return sorted(
-        path
-        for path in raw_dir.glob(f"*_rep{rep}_log.csv")
-        if TRACE_NAME_PATTERN.match(path.name)
-    )
-
-
-def load_raw_run(trace_paths: list[Path]) -> pd.DataFrame:
-    """One dataframe with all records of one run.
-
-    Adds NodeId and NodeType ('anchor', 'persistentvanchor' or 'node') of the
-    device that wrote the record.  NodeIds follow
-    post_processing.set_node_id_in_df and the OMNeT++ nodeId parameter:
-    anchors 1..A, then persistent v-anchors, then nodes.
-    """
-    parsed = {}
-    for path in trace_paths:
-        node_type, index, _ = TRACE_NAME_PATTERN.match(path.name).groups()
-        parsed[path] = (node_type.casefold(), int(index))
-
-    counts = {
-        node_type: sum(parsed_type == node_type for parsed_type, _ in parsed.values())
-        for node_type in ("anchor", "persistentvanchor", "node")
-    }
-    offsets = {
-        "anchor": 0,
-        "persistentvanchor": counts["anchor"],
-        "node": counts["anchor"] + counts["persistentvanchor"],
-    }
-
-    dataframes = []
-    for path, (node_type, index) in parsed.items():
-        dataframe = pd.read_csv(path, skipinitialspace=True)
-        dataframe.columns = dataframe.columns.str.strip()
-        dataframe["NodeId"] = offsets[node_type] + index + 1
-        dataframe["NodeType"] = node_type
-        dataframes.append(dataframe)
-
-    if not dataframes:
-        return pd.DataFrame()
-    return pd.concat(dataframes, ignore_index=True)
-
-
-# -----------------------------------------------------------------------------
-# Opportunities
-# -----------------------------------------------------------------------------
-
 def make_opportunity_df(
     raw_df: pd.DataFrame,
     method: str,
+    t_twr_positions: set[tuple[int, int]],
     num_nodes: int | None = None,
 ) -> pd.DataFrame:
     """One row per anchor sequence with the number of eligible nodes and the outcome.
 
-    Every anchor sequence offers one opportunity for a new v-anchor: the first
-    v-anchor slot after the anchor slots.  A node is eligible if it heard at
-    least MIN_HEARD_ANCHORS anchors of the sequence.  Centralized: the node
-    selected by the anchors may transmit in this slot.  Distributed: every
-    eligible node contends; a contention succeeded if the node sends the
-    follow-up in the next sequence.
+    Every anchor sequence offers one opportunity for a new t-anchor: the first
+    t-anchor slot after the anchor slots.  A node is eligible if it heard at
+    least MIN_HEARD_ANCHORS anchors of the sequence and is not busy, i.e. does
+    not send a further t-anchor slot of an earlier selection in this sequence
+    (a node is one t-anchor at a time).  Centralized: the selected node may
+    transmit in this slot.  Distributed: every eligible node contends; a
+    contention succeeded if the node sends the follow-up in the next sequence.
 
-    raw_df:    all records of one run (load_raw_run).
-    method:    'CENTRALIZED' or 'DISTRIBUTED'; decides when an opportunity
-               counts as used.
+    raw_df:    all records of one run (runs.read_traces).
+    method:    'CENTRALIZED' or 'DISTRIBUTED'; decides
+               when an opportunity counts as used.
+    t_twr_positions: (NodeId, seqNo) of the node transmissions with a t-TWR
+               position (localization events of the post-processing).
     num_nodes: number of simulated nodes.  Defaults to the nodes that appear
                in raw_df; pass the number of node traces so that nodes without
                any record count as well.
 
-    The last sequence is dropped: the simulation may end before its v-anchor
+    The last sequence is dropped: the simulation may end before its t-anchor
     slots, and a Distributed contention can only be judged in the next one.
     """
     if method not in SUPPORTED_METHODS:
@@ -188,7 +111,7 @@ def make_opportunity_df(
         {anchor_id: slot for slot, anchor_id in enumerate(anchor_ids)}
     )
     anchor_times = anchor_tx_df.assign(slot=anchor_slot).pivot_table(
-        index="seqNo", columns="slot", values="sim_timestamp", aggfunc="min"
+        index="seqNo", columns="slot", values=SIM, aggfunc="min"
     )
     slot_duration = float(
         ((anchor_times[num_anchors - 1] - anchor_times[0]) / (num_anchors - 1)).median()
@@ -201,31 +124,32 @@ def make_opportunity_df(
     # Assign every node transmission to the sequence in whose time span it was
     # sent, not to its seqNo: a node that heard no anchor of a sequence still
     # sends with the seqNo of the previous one ("stale").  Subtracting half a
-    # slot before the lookup keeps transmissions that are sent slightly
-    # before their nominal slot time (Centralized: -0.1 slots) in the right
-    # sequence.
+    # slot before the lookup keeps transmissions that deviate slightly from
+    # their nominal slot time in the right sequence.
     seq_start_time = seq_start_time.sort_index()
     if not seq_start_time.is_monotonic_increasing:
         raise ValueError("Anchor sequences are not ordered in time")
+    # Index of the last sequence that started before the (shifted) transmission time.
     sequence_index = np.searchsorted(
         seq_start_time.to_numpy(),
-        node_tx_df["sim_timestamp"].to_numpy() - 0.5 * slot_duration,
+        node_tx_df[SIM].to_numpy() - 0.5 * slot_duration,
         side="right",
     ) - 1
     # Transmissions before the first sequence (index -1) cannot be assigned.
     node_tx_df = node_tx_df.loc[sequence_index >= 0].assign(
         sequence=seq_start_time.index.to_numpy()[sequence_index[sequence_index >= 0]]
     )
+    # Slot within the sequence, rounded to the nearest slot start.
     node_tx_df = node_tx_df.assign(
         slot=np.rint(
-            (node_tx_df["sim_timestamp"] - node_tx_df["sequence"].map(seq_start_time))
+            (node_tx_df[SIM] - node_tx_df["sequence"].map(seq_start_time))
             / slot_duration
         ),
         stale=node_tx_df["seqNo"] != node_tx_df["sequence"],
     )
 
     # --- 4. Was the opportunity used? ----------------------------------------
-    # The first v-anchor slot directly follows the anchor slots (slot index
+    # The first t-anchor slot directly follows the anchor slots (slot index
     # num_anchors); the follow-up of the previous sequence is sent one slot
     # later.
     first_slot_tx = node_tx_df.loc[node_tx_df["slot"] == num_anchors]
@@ -236,11 +160,24 @@ def make_opportunity_df(
     stale_first_slot_senders = (
         first_slot_tx.loc[first_slot_tx["stale"]].groupby("sequence")["NodeId"].nunique()
     )
+    # The new t-anchor of sequence s got a t-TWR position if one of its further
+    # transmissions (slot num_anchors + k of sequence s + k) has one.
+    further_tx = node_tx_df.loc[node_tx_df["slot"] > num_anchors]
+    has_position = [key in t_twr_positions for key in zip(further_tx["NodeId"], further_tx["seqNo"])]
+    positioned_tx = further_tx.loc[has_position]
+    positioned = set(zip(
+        (positioned_tx["sequence"] - (positioned_tx["slot"] - num_anchors)).astype(int), positioned_tx["NodeId"]
+    ))
+
     # Transmissions with a stale seqNo never count as used.
     if method == "CENTRALIZED":
         # Only the selected node may send in the first slot, so any
         # transmission there answers the selection of this sequence.
-        used_seq_nos = set(fresh_first_slot_tx["sequence"])
+        used_seq_nos = {
+            seq_no
+            for seq_no, node_id in zip(fresh_first_slot_tx["sequence"], fresh_first_slot_tx["NodeId"])
+            if (seq_no, node_id) in positioned
+        }
     else:
         # A contention in sequence s succeeded if its node sends the follow-up
         # in sequence s + 1 (only nodes confirmed by the anchors do so).
@@ -250,21 +187,23 @@ def make_opportunity_df(
             for seq_no, node_id in zip(
                 fresh_first_slot_tx["sequence"], fresh_first_slot_tx["NodeId"]
             )
-            if (seq_no, node_id) in follow_ups
+            if (seq_no, node_id) in follow_ups and (seq_no, node_id) in positioned
         }
 
     # --- 5. Eligible nodes ---------------------------------------------------
     # Eligible: heard at least MIN_HEARD_ANCHORS different anchors of the
     # sequence (receptions of anchor packets in the node traces; the seqNo of
-    # anchor packets is always the current one).
+    # anchor packets is always the current one) and sends no further t-anchor
+    # slot in it.
     anchor_rx_df = raw_df.loc[
         (raw_df["NodeType"] == "node")
         & raw_df["srcId"].isin(anchor_ids)
         & (raw_df["srcId"] != raw_df["NodeId"])
     ]
     heard_anchors = anchor_rx_df.groupby(["seqNo", "NodeId"])["srcId"].nunique()
+    busy = heard_anchors.index.isin(list(zip(further_tx["sequence"], further_tx["NodeId"])))
     num_eligible = (
-        (heard_anchors >= MIN_HEARD_ANCHORS)
+        ((heard_anchors >= MIN_HEARD_ANCHORS) & ~busy)
         .groupby(level="seqNo")
         .sum()
     )
@@ -307,8 +246,8 @@ def opportunity_metrics(opportunity_df: pd.DataFrame) -> dict[str, float]:
 
         opportunity_<outcome>   fraction of sequences with this outcome (sum = 1)
         opportunity_missed      sum of the missed_* fractions
-        opportunity_efficiency  used / sequences with >= 1 eligible node
-                                (NaN if there is none)
+        opportunity_efficiency  used sequences with >= 1 eligible node / sequences
+                                with >= 1 eligible node (NaN if there is none)
         mean_eligible_fraction  mean fraction of eligible nodes per sequence
         num_opportunities       number of evaluated sequences
     """
@@ -321,14 +260,15 @@ def opportunity_metrics(opportunity_df: pd.DataFrame) -> dict[str, float]:
         .value_counts(normalize=True)
         .reindex(OUTCOMES, fill_value=0.0)
     )
-    num_usable = (opportunity_df["num_eligible_nodes"] > 0).sum()
+    usable = opportunity_df["num_eligible_nodes"] > 0
+    num_usable = usable.sum()
     return {
         **{f"opportunity_{outcome}": float(outcome_fractions[outcome]) for outcome in OUTCOMES},
         "opportunity_missed": float(
             sum(outcome_fractions[outcome] for outcome in OUTCOMES if outcome.startswith("missed_"))
         ),
         "opportunity_efficiency": (
-            float(opportunity_df["used"].sum() / num_usable) if num_usable else np.nan
+            float((opportunity_df["used"] & usable).sum() / num_usable) if num_usable else np.nan
         ),
         "mean_eligible_fraction": float(
             (opportunity_df["num_eligible_nodes"] / opportunity_df["num_nodes"]).mean()
@@ -338,21 +278,19 @@ def opportunity_metrics(opportunity_df: pd.DataFrame) -> dict[str, float]:
 
 
 def load_run_opportunities(
-    experiment_path: Path,
-    parameter_dir_name: str,
-    rep: int,
-    method: str,
+    experiment_path: Path, parameters: dict, rep: int, t_twr_positions: set[tuple[int, int]],
 ) -> pd.DataFrame | None:
-    """Opportunity table of one run, or None if the method has none or traces are missing.
+    """Opportunity table of one run, or None if its method has none or traces are missing.
 
-    Entry point for extract_statistics.py.  The number of nodes is taken from
-    the number of node traces, so nodes that never received anything still
-    count in the eligible fraction.
+    Entry point for extract_statistics.py; parameters are those of the run
+    directory with Method, e.g. {"interAnchorDist": 200, "Method": "CENTRALIZED"}.
+    The number of nodes is taken from the number of node traces, so nodes that
+    never received anything still count in the eligible fraction.
     """
+    method = parameters["Method"]
     if method not in SUPPORTED_METHODS:
         return None
-    trace_paths = find_raw_traces(experiment_path, parameter_dir_name, rep)
+    trace_paths = find_run_traces(experiment_path, parameters, rep)
     if not trace_paths:
         return None
-    num_nodes = sum(path.name.startswith("node[") for path in trace_paths)
-    return make_opportunity_df(load_raw_run(trace_paths), method, num_nodes)
+    return make_opportunity_df(read_traces(trace_paths), method, t_twr_positions, num_node_traces(trace_paths))

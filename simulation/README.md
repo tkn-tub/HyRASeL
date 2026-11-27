@@ -24,7 +24,9 @@ The method is selected with `**.app.method`:
 | `CENTRALIZED`                  | HyRASeL                               |
 | `TWR`                          | TWR (baseline)                        |
 | `HYPERBOLIC_SELF_LOCALIZATION` | Chiasson et al. (baseline)            |
-| `DISTRIBUTED`                  | HyRASeL with distributed v-Anchor selection (not evaluated) |
+| `DISTRIBUTED`                  | HyRASeL with distributed t-Anchor selection (not evaluated) |
+
+`[General]` holds the default scenario; every config selects its methods with `**.app.method = ${Method= ...}`.
 
 ## Build and Run
 

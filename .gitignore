@@ -4,3 +4,7 @@ inet-4.5.4/
 # Output of the top-level Makefile
 logs/
 figures/
+
+
+
+tmp/
